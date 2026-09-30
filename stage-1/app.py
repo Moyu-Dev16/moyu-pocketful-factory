@@ -5,7 +5,7 @@ Full clean-room implementation conforming to Pocketful Stage 1 specification.
 from __future__ import annotations
 
 import copy
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import hashlib
 import json
 import os
@@ -34,12 +34,119 @@ STATE: dict = {
     "tokens": {},           # token -> user_id
     "payments": [],         # list of payment dicts
     "requests": [],         # list of request dicts
+    "ledger": [],           # append-only double-entry journal
+    "initial_total": 0,     # reset fixture conservation anchor
     "idempotency": {},      # (user_id, method, path, key) -> {"canonical_body": ..., "response": ..., "status": ...}
 }
 
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def parse_rfc3339(value: str | None) -> datetime | None:
+    """解析带时区的 RFC3339 时间，拒绝含糊的本地时间。"""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed
+
+
+def ledger_balances(effective_at: datetime | None = None,
+                    recorded_at: datetime | None = None) -> dict[str, int]:
+    """只从期初余额与不可变分录重放余额，可按双时态截断。调用方须持有锁。"""
+    balances = {
+        uid: int(user.get("opening_balance", 0))
+        for uid, user in STATE["users"].items()
+    }
+    for entry in STATE["ledger"]:
+        effective = parse_rfc3339(entry["effective_at"])
+        recorded = parse_rfc3339(entry["recorded_at"])
+        if effective_at is not None and (effective is None or effective > effective_at):
+            continue
+        if recorded_at is not None and (recorded is None or recorded > recorded_at):
+            continue
+        balances[entry["account_id"]] = balances.get(entry["account_id"], 0) + entry["delta"]
+    return balances
+
+
+def build_transfer_entries(transaction_id: str, from_user_id: str, to_user_id: str,
+                           amount: int, effective_at: str, recorded_at: str,
+                           *, payment_id: str | None = None,
+                           entry_kind: str = "payment") -> list[dict]:
+    """构造恰好一借一贷的不可变分录对；借贷金额和币种始终一致。"""
+    common = {
+        "transaction_id": transaction_id,
+        "payment_id": payment_id,
+        "amount": amount,
+        "currency": STATE["currency"],
+        "effective_at": effective_at,
+        "recorded_at": recorded_at,
+        "kind": entry_kind,
+    }
+    return [
+        {**common, "entry_id": f"le_{uuid.uuid4().hex}", "account_id": from_user_id,
+         "side": "debit", "delta": -amount},
+        {**common, "entry_id": f"le_{uuid.uuid4().hex}", "account_id": to_user_id,
+         "side": "credit", "delta": amount},
+    ]
+
+
+def commit_transfers(transfers: list[dict]) -> None:
+    """在线性化临界区内校验并一次提交多笔转账，同时核对缓存与账本重放。"""
+    proposed = {uid: user["balance"] for uid, user in STATE["users"].items()}
+    pending_entries = []
+    for transfer in transfers:
+        amount = transfer["amount"]
+        proposed[transfer["from_user_id"]] -= amount
+        proposed[transfer["to_user_id"]] += amount
+        pending_entries.extend(build_transfer_entries(
+            transfer["transaction_id"], transfer["from_user_id"], transfer["to_user_id"],
+            amount, transfer["effective_at"], transfer["recorded_at"],
+            payment_id=transfer.get("payment_id"), entry_kind=transfer.get("kind", "payment")
+        ))
+
+    if any(balance < 0 for balance in proposed.values()):
+        raise ValueError("insufficient_funds")
+    if sum(proposed.values()) != STATE["initial_total"]:
+        raise RuntimeError("balance_conservation_violation")
+    if any(sum(e["delta"] for e in pending_entries if e["transaction_id"] == tx) != 0
+           for tx in {e["transaction_id"] for e in pending_entries}):
+        raise RuntimeError("unbalanced_transaction")
+
+    # 以当前已知账本重放每个业务时间边界，禁止回填或更正制造历史透支。
+    historical = {
+        uid: int(user.get("opening_balance", 0))
+        for uid, user in STATE["users"].items()
+    }
+    if any(balance < 0 for balance in historical.values()):
+        raise ValueError("historical_overdraft")
+    grouped: dict[datetime, list[dict]] = {}
+    for entry in [*STATE["ledger"], *pending_entries]:
+        effective = parse_rfc3339(entry["effective_at"])
+        if effective is None:
+            raise RuntimeError("invalid_ledger_time")
+        grouped.setdefault(effective, []).append(entry)
+    for effective in sorted(grouped):
+        for entry in grouped[effective]:
+            historical[entry["account_id"]] += entry["delta"]
+        if any(balance < 0 for balance in historical.values()):
+            raise ValueError("historical_overdraft")
+
+    expected = ledger_balances()
+    for entry in pending_entries:
+        expected[entry["account_id"]] += entry["delta"]
+    if expected != proposed:
+        raise RuntimeError("ledger_cache_mismatch")
+
+    for uid, balance in proposed.items():
+        STATE["users"][uid]["balance"] = balance
+    STATE["ledger"].extend(pending_entries)
 
 
 def is_valid_amount(val) -> bool:
@@ -157,6 +264,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.handle_activity(user, parsed_url.query)
             if path == "/requests":
                 return self.handle_requests_list(user, parsed_url.query)
+            if path == "/statement":
+                return self.handle_statement(user, parsed_url.query)
+            if path == "/ledger":
+                return self.handle_ledger(user, parsed_url.query)
             return self.fail(404, "not_found")
 
         # POST endpoints
@@ -169,8 +280,9 @@ class Handler(BaseHTTPRequestHandler):
                 "/settlements",
             )
             is_pay_request = re.fullmatch(r"/requests/[^/]+/pay", path)
+            is_correction = re.fullmatch(r"/payments/[^/]+/corrections", path)
 
-            if path in idempotent_paths or is_pay_request:
+            if path in idempotent_paths or is_pay_request or is_correction:
                 return self.handle_idempotent_post(method, path, user)
 
             # Non-idempotent write paths
@@ -210,6 +322,7 @@ class Handler(BaseHTTPRequestHandler):
             STATE["tokens"] = {}
             STATE["payments"] = []
             STATE["requests"] = []
+            STATE["ledger"] = []
             STATE["idempotency"] = {}
 
             for u in fixture.get("users", []):
@@ -226,7 +339,8 @@ class Handler(BaseHTTPRequestHandler):
                     "password": hashed_pwd,
                     "display_name": u.get("display_name", u.get("handle", "")),
                     "handle": u["handle"],
-                    "balance": int(u.get("balance", 0))
+                    "balance": int(u.get("balance", 0)),
+                    "opening_balance": int(u.get("balance", 0))
                 }
                 STATE["users"][uid] = user_obj
                 STATE["by_handle"][user_obj["handle"]] = uid
@@ -249,7 +363,24 @@ class Handler(BaseHTTPRequestHandler):
                     "settlement_id": p.get("settlement_id"),
                     "created_at": p.get("created_at") or "2026-09-01T00:00:00+00:00"
                 }
+                pm["effective_at"] = p.get("effective_at", pm["created_at"])
+                pm["recorded_at"] = p.get("recorded_at", pm["created_at"])
+                pm["revisions"] = copy.deepcopy(p.get("revisions", [{
+                    "revision": 1, "amount": pm["amount"],
+                    "effective_at": pm["effective_at"], "recorded_at": pm["recorded_at"],
+                    "reason": ""
+                }]))
                 STATE["payments"].append(pm)
+
+                # fixture 中 payment 是既有历史，反推出可重放的期初余额并补齐双录分录。
+                created_at = pm["effective_at"]
+                STATE["users"][pm["from_user_id"]]["opening_balance"] += pm["amount"]
+                STATE["users"][pm["to_user_id"]]["opening_balance"] -= pm["amount"]
+                STATE["ledger"].extend(build_transfer_entries(
+                    f"tx_seed_{pm['payment_id']}", pm["from_user_id"], pm["to_user_id"],
+                    pm["amount"], created_at, pm["recorded_at"], payment_id=pm["payment_id"],
+                    entry_kind="fixture"
+                ))
 
             for r in fixture.get("requests", []):
                 req_u = STATE["users"].get(r["requester_id"])
@@ -268,6 +399,14 @@ class Handler(BaseHTTPRequestHandler):
                     "created_at": r.get("created_at") or "2026-09-01T00:00:00+00:00"
                 }
                 STATE["requests"].append(rq)
+
+            STATE["initial_total"] = sum(u["balance"] for u in STATE["users"].values())
+            if ledger_balances() != {uid: u["balance"] for uid, u in STATE["users"].items()}:
+                return self.fail(422, "validation_failed")
+            try:
+                commit_transfers([])
+            except (ValueError, RuntimeError):
+                return self.fail(422, "validation_failed")
 
         return self.send_json(204, None)
 
@@ -290,6 +429,8 @@ class Handler(BaseHTTPRequestHandler):
                 "tokens": copy.deepcopy(STATE["tokens"]),
                 "payments": copy.deepcopy(STATE["payments"]),
                 "requests": copy.deepcopy(STATE["requests"]),
+                "ledger": copy.deepcopy(STATE["ledger"]),
+                "initial_total": STATE["initial_total"],
                 "idempotency": idem_export,
             }
 
@@ -325,6 +466,19 @@ class Handler(BaseHTTPRequestHandler):
             STATE["tokens"] = copy.deepcopy(s["tokens"])
             STATE["payments"] = copy.deepcopy(s["payments"])
             STATE["requests"] = copy.deepcopy(s["requests"])
+            STATE["ledger"] = copy.deepcopy(s.get("ledger", []))
+            STATE["initial_total"] = int(s.get(
+                "initial_total", sum(u["balance"] for u in STATE["users"].values())
+            ))
+
+            for user in STATE["users"].values():
+                user.setdefault("opening_balance", user["balance"])
+
+            cached = {uid: u["balance"] for uid, u in STATE["users"].items()}
+            if STATE["ledger"] and ledger_balances() != cached:
+                return self.fail(422, "validation_failed")
+            if sum(cached.values()) != STATE["initial_total"]:
+                return self.fail(422, "validation_failed")
 
             STATE["idempotency"] = {}
             for k_str, v in s.get("idempotency", {}).items():
@@ -374,7 +528,8 @@ class Handler(BaseHTTPRequestHandler):
                 "password": hash_password(password),
                 "display_name": display_name or derived_handle,
                 "handle": derived_handle,
-                "balance": 0
+                "balance": 0,
+                "opening_balance": 0
             }
             STATE["users"][user_id] = user
             STATE["by_email"][email.lower()] = user_id
@@ -531,6 +686,63 @@ class Handler(BaseHTTPRequestHandler):
             "has_more": has_more
         })
 
+    def _snapshot_times(self, query_str: str):
+        """统一解析双时态查询参数；effective_at 是业务时间，recorded_at 是认知时间。"""
+        query = parse_qs(query_str, keep_blank_values=True)
+        now = datetime.now(timezone.utc)
+        effective_raw = (query.get("effective_at") or query.get("as_of") or [None])[-1]
+        recorded_raw = (query.get("recorded_at") or query.get("known_at") or [None])[-1]
+        effective = parse_rfc3339(effective_raw) if effective_raw is not None else now
+        recorded = parse_rfc3339(recorded_raw) if recorded_raw is not None else now
+        if effective is None or recorded is None:
+            return None
+        return effective, recorded
+
+    def handle_statement(self, user, query_str: str):
+        """返回调用方在指定有效时间与记录时间下可复现的余额快照和分录。"""
+        times = self._snapshot_times(query_str)
+        if times is None:
+            return self.fail(422, "validation_failed")
+        effective, recorded = times
+        with STATE_LOCK:
+            entries = []
+            for entry in STATE["ledger"]:
+                if entry["account_id"] != user["id"]:
+                    continue
+                eff = parse_rfc3339(entry["effective_at"])
+                rec = parse_rfc3339(entry["recorded_at"])
+                if eff is not None and rec is not None and eff <= effective and rec <= recorded:
+                    entries.append(copy.deepcopy(entry))
+            entries.sort(key=lambda item: (item["effective_at"], item["recorded_at"], item["entry_id"]))
+            balances = ledger_balances(effective, recorded)
+            return self.send_json(200, {
+                "user_id": user["id"],
+                "balance": balances[user["id"]],
+                "currency": STATE["currency"],
+                "effective_at": effective.isoformat(),
+                "recorded_at": recorded.isoformat(),
+                "entries": entries,
+            })
+
+    def handle_ledger(self, user, query_str: str):
+        """公开当前用户可见的不可变账本，用于审计一借一贷和重放一致性。"""
+        times = self._snapshot_times(query_str)
+        if times is None:
+            return self.fail(422, "validation_failed")
+        effective, recorded = times
+        with STATE_LOCK:
+            visible_tx = {
+                entry["transaction_id"] for entry in STATE["ledger"]
+                if entry["account_id"] == user["id"]
+            }
+            entries = [
+                copy.deepcopy(entry) for entry in STATE["ledger"]
+                if entry["transaction_id"] in visible_tx
+                and parse_rfc3339(entry["effective_at"]) <= effective
+                and parse_rfc3339(entry["recorded_at"]) <= recorded
+            ]
+            return self.send_json(200, {"entries": entries})
+
     # =========================================================================
     # Idempotent Write Handler
     # =========================================================================
@@ -555,7 +767,7 @@ class Handler(BaseHTTPRequestHandler):
             if idem_token in STATE["idempotency"]:
                 record = STATE["idempotency"][idem_token]
                 if record["canonical_body"] == canon_body:
-                    return self.send_json(200, record["response"])
+                    return self.send_json(record["status"], record["response"])
                 else:
                     return self.fail(409, "idempotency_key_reuse")
 
@@ -571,6 +783,9 @@ class Handler(BaseHTTPRequestHandler):
             elif path.startswith("/requests/") and path.endswith("/pay"):
                 request_id = path.split("/")[2]
                 status, resp = self.exec_request_pay(request_id, user, body)
+            elif path.startswith("/payments/") and path.endswith("/corrections"):
+                payment_id = path.split("/")[2]
+                status, resp = self.exec_payment_correction(payment_id, user, body)
             else:
                 return self.fail(404, "not_found")
 
@@ -597,6 +812,7 @@ class Handler(BaseHTTPRequestHandler):
         amount = body.get("amount")
         note = body.get("note", "")
         visibility = body.get("visibility", "public")
+        effective_at = body.get("effective_at")
 
         if not isinstance(to_handle, str):
             return 422, "validation_failed"
@@ -616,6 +832,11 @@ class Handler(BaseHTTPRequestHandler):
         if visibility not in ("public", "private"):
             return 422, "validation_failed"
 
+        if effective_at is not None:
+            effective_dt = parse_rfc3339(effective_at)
+            if effective_dt is None or effective_dt > datetime.now(timezone.utc):
+                return 422, "validation_failed"
+
         to_uid = STATE["by_handle"].get(to_handle)
         if not to_uid:
             return 404, "not_found"
@@ -625,12 +846,9 @@ class Handler(BaseHTTPRequestHandler):
         if sender["balance"] < amount:
             return 409, "insufficient_funds"
 
-        # Transfer funds
-        sender["balance"] -= amount
-        recipient["balance"] += amount
-
         payment_id = f"p_{uuid.uuid4().hex[:8]}"
-        created_at = now_iso()
+        recorded_at = now_iso()
+        effective_at = effective_at or recorded_at
         payment_obj = {
             "payment_id": payment_id,
             "from_user_id": sender["id"],
@@ -643,10 +861,78 @@ class Handler(BaseHTTPRequestHandler):
             "visibility": visibility,
             "request_id": None,
             "settlement_id": None,
-            "created_at": created_at
+            "created_at": recorded_at,
+            "effective_at": effective_at,
+            "recorded_at": recorded_at,
+            "revisions": [{
+                "revision": 1, "amount": amount, "effective_at": effective_at,
+                "recorded_at": recorded_at, "reason": ""
+            }]
         }
+        try:
+            commit_transfers([{
+                "transaction_id": f"tx_{payment_id}", "payment_id": payment_id,
+                "from_user_id": sender["id"], "to_user_id": recipient["id"],
+                "amount": amount, "effective_at": effective_at, "recorded_at": recorded_at
+            }])
+        except ValueError as error:
+            return 409, str(error)
         STATE["payments"].append(payment_obj)
         return 201, payment_obj
+
+    def exec_payment_correction(self, payment_id: str, user, body) -> tuple[int, any]:
+        """追加修订和差额分录，不覆盖原 payment 或既有账本历史。"""
+        payment = next((p for p in STATE["payments"] if p["payment_id"] == payment_id), None)
+        if not payment:
+            return 404, "not_found"
+        if payment["from_user_id"] != user["id"]:
+            return 403, "forbidden"
+
+        revisions = payment.setdefault("revisions", [{
+            "revision": 1, "amount": payment["amount"],
+            "effective_at": payment.get("effective_at", payment["created_at"]),
+            "recorded_at": payment.get("recorded_at", payment["created_at"]), "reason": ""
+        }])
+        expected = body.get("expected_revision")
+        amount = body.get("amount")
+        effective_at = body.get("effective_at")
+        reason = body.get("reason")
+        if (isinstance(expected, bool) or not isinstance(expected, int)
+                or expected != revisions[-1]["revision"]):
+            return 409, "stale_revision"
+        if isinstance(amount, bool) or not isinstance(amount, int) or not 0 <= amount <= 1_000_000_000:
+            return 422, "validation_failed"
+        effective_dt = parse_rfc3339(effective_at)
+        if (effective_dt is None or effective_dt > datetime.now(timezone.utc)
+                or not isinstance(reason, str) or not 1 <= len(reason) <= 200):
+            return 422, "validation_failed"
+
+        delta = amount - revisions[-1]["amount"]
+        recorded_dt = datetime.now(timezone.utc)
+        last_recorded = parse_rfc3339(revisions[-1]["recorded_at"])
+        if last_recorded is not None and recorded_dt <= last_recorded:
+            recorded_dt = last_recorded + timedelta(microseconds=1)
+        recorded_at = recorded_dt.isoformat()
+
+        if delta:
+            from_id = payment["from_user_id"] if delta > 0 else payment["to_user_id"]
+            to_id = payment["to_user_id"] if delta > 0 else payment["from_user_id"]
+            try:
+                commit_transfers([{
+                    "transaction_id": f"tx_corr_{payment_id}_{expected + 1}",
+                    "payment_id": payment_id, "from_user_id": from_id, "to_user_id": to_id,
+                    "amount": abs(delta), "effective_at": effective_at,
+                    "recorded_at": recorded_at, "kind": "correction"
+                }])
+            except ValueError as error:
+                return 409, str(error)
+
+        revision = {
+            "revision": expected + 1, "amount": amount, "effective_at": effective_at,
+            "recorded_at": recorded_at, "reason": reason, "delta": delta
+        }
+        revisions.append(revision)
+        return 201, revision
 
     def exec_request(self, user, body) -> tuple[int, any]:
         if "payer_handle" not in body or "amount" not in body:
@@ -716,10 +1002,6 @@ class Handler(BaseHTTPRequestHandler):
 
         requester = STATE["users"][rq["requester_id"]]
 
-        # Transfer funds
-        payer["balance"] -= amount
-        requester["balance"] += amount
-
         payment_id = f"p_{uuid.uuid4().hex[:8]}"
         created_at = now_iso()
         payment_obj = {
@@ -734,8 +1016,20 @@ class Handler(BaseHTTPRequestHandler):
             "visibility": visibility,
             "request_id": rq["request_id"],
             "settlement_id": None,
-            "created_at": created_at
+            "created_at": created_at,
+            "effective_at": created_at,
+            "recorded_at": created_at,
+            "revisions": [{
+                "revision": 1, "amount": amount, "effective_at": created_at,
+                "recorded_at": created_at, "reason": ""
+            }]
         }
+        commit_transfers([{
+            "transaction_id": f"tx_{payment_id}", "payment_id": payment_id,
+            "from_user_id": payer["id"], "to_user_id": requester["id"],
+            "amount": amount, "effective_at": created_at, "recorded_at": created_at,
+            "kind": "request_payment"
+        }])
         STATE["payments"].append(payment_obj)
 
         rq["status"] = "paid"
@@ -878,13 +1172,10 @@ class Handler(BaseHTTPRequestHandler):
             if STATE["users"][uid]["balance"] + delta < 0:
                 return 409, "insufficient_funds"
 
-        # Apply transfers
-        for uid, delta in net_deltas.items():
-            STATE["users"][uid]["balance"] += delta
-
         settlement_id = f"st_{uuid.uuid4().hex[:8]}"
         committed_at = now_iso()
         payments_out = []
+        ledger_transfers = []
 
         for item in validated_transfers:
             payment_obj = {
@@ -899,10 +1190,28 @@ class Handler(BaseHTTPRequestHandler):
                 "visibility": item["visibility"],
                 "request_id": None,
                 "settlement_id": settlement_id,
-                "created_at": committed_at
+                "created_at": committed_at,
+                "effective_at": committed_at,
+                "recorded_at": committed_at,
+                "revisions": [{
+                    "revision": 1, "amount": item["amount"], "effective_at": committed_at,
+                    "recorded_at": committed_at, "reason": ""
+                }]
             }
-            STATE["payments"].append(payment_obj)
             payments_out.append(payment_obj)
+            ledger_transfers.append({
+                "transaction_id": f"tx_{payment_obj['payment_id']}",
+                "payment_id": payment_obj["payment_id"],
+                "from_user_id": item["from_uid"], "to_user_id": item["to_uid"],
+                "amount": item["amount"], "effective_at": committed_at,
+                "recorded_at": committed_at, "kind": "settlement"
+            })
+
+        try:
+            commit_transfers(ledger_transfers)
+        except ValueError:
+            return 409, "insufficient_funds"
+        STATE["payments"].extend(payments_out)
 
         return 201, {
             "settlement_id": settlement_id,
