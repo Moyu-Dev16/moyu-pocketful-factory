@@ -1,0 +1,72 @@
+1
+00:00:00,100 --> 00:00:06,600
+Welcome to Pocketful Factory, our submission for the WeAreDevelopers and BAND Dark Factory hackathon.
+
+2
+00:00:06,550 --> 00:00:15,062
+In this challenge, our goal was to build a complete bitemporal financial settlement engine without human developers writing any business logic.
+
+3
+00:00:15,062 --> 00:00:22,425
+Inside Band Desktop, we established three distinct agent seats: Architect, Coder, and Auditor.
+
+4
+00:00:22,425 --> 00:00:27,762
+Each seat operates under a generic mandate with strict separation of concerns.
+
+5
+00:00:27,762 --> 00:00:31,187
+The operator initiates the project from the room.
+
+6
+00:00:31,187 --> 00:00:38,275
+The Architect verifies state invariants, defines interface contracts, and hands off tasks to the Coder.
+
+7
+00:00:38,275 --> 00:00:49,212
+When tasks complete, the Auditor performs rigorous verification against edge cases and reports findings back in the room, fulfilling the reciprocal messaging requirements of Gate 2.
+
+8
+00:00:49,372 --> 00:00:52,472
+Here is our official harness verification.
+
+9
+00:00:52,422 --> 00:00:57,134
+All offline static gates pass cleanly with zero track leaks.
+
+10
+00:00:57,134 --> 00:01:07,084
+Running the multi-stage evaluation across all four stages, our service achieves a one-hundred percent pass rate across all one hundred and ninety-three conformance tests.
+
+11
+00:01:07,084 --> 00:01:13,672
+With zero regressions and zero manual workarounds, our factory successfully claims Stage 4.
+
+12
+00:01:13,828 --> 00:01:19,078
+Now let's examine the generated web client running against our Stage 4 server.
+
+13
+00:01:19,028 --> 00:01:21,253
+We sign in as Ada.
+
+14
+00:01:21,253 --> 00:01:25,965
+The dashboard displays the real-time available balance and active holds.
+
+15
+00:01:25,965 --> 00:01:37,078
+When transferring 10 Euros to Bob, the client performs an optimistic update, enforces client idempotency to prevent double-spending, and records the transfer in the activity feed.
+
+16
+00:01:37,078 --> 00:01:44,565
+Navigating to statements, our bitemporal ledger maintains truthful historical records with exact balance reconciliation.
+
+17
+00:01:44,565 --> 00:01:48,728
+Every stage builds cleanly from an isolated container.
+
+18
+00:01:48,728 --> 00:01:50,740
+Thank you for watching!
+
