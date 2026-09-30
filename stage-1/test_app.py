@@ -68,6 +68,12 @@ class WalletContractTests(unittest.TestCase):
             "to_handle": "bob", "amount": amount, **extra
         }, self.alice, key)
 
+    def export_document(self):
+        """读取可直接回灌 import 的完整导出文档。"""
+        status, document = self.request("GET", "/_test/export")
+        self.assertEqual(200, status)
+        return document
+
     def test_double_entry_conservation_and_replay(self):
         status, payment = self.pay(35, "double-entry")
         self.assertEqual(201, status)
@@ -165,6 +171,51 @@ class WalletContractTests(unittest.TestCase):
         _, exported = self.request("GET", "/_test/export")
         revisions = exported["state"]["payments"][0]["revisions"]
         self.assertEqual([30, 20], [revision["amount"] for revision in revisions])
+
+    def test_failed_import_is_atomic_and_preserves_every_exported_field(self):
+        self.assertEqual(201, self.pay(10, "state-before-bad-import")[0])
+        before = self.export_document()
+        malformed = json.loads(json.dumps(before))
+        malformed["state"]["users"]["u_alice"]["balance"] = 999
+        self.assertEqual(422, self.request("POST", "/_test/import", malformed)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_import_rejects_single_sided_transaction_without_state_change(self):
+        _, payment = self.pay(10, "paired-before-corruption")
+        before = self.export_document()
+        malformed = json.loads(json.dumps(before))
+        payment_id = payment["payment_id"]
+        malformed["state"]["ledger"] = [
+            entry for entry in malformed["state"]["ledger"]
+            if not (entry["payment_id"] == payment_id and entry["side"] == "credit")
+        ]
+        self.assertEqual(422, self.request("POST", "/_test/import", malformed)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_failed_reset_is_atomic_and_preserves_every_exported_field(self):
+        self.assertEqual(201, self.pay(5, "state-before-bad-reset")[0])
+        before = self.export_document()
+        invalid_fixture = {
+            "currency": "EUR", "minor_units": 2,
+            "users": [
+                {"id": "u_alice", "email": "alice@example.com", "password": "password1",
+                 "handle": "alice", "balance": 0},
+                {"id": "u_bob", "email": "bob@example.com", "password": "password2",
+                 "handle": "bob", "balance": 0},
+            ],
+            "payments": [{
+                "id": "p_invalid", "from_user_id": "u_alice", "to_user_id": "u_bob",
+                "amount": 10, "created_at": "2026-09-01T00:00:00+00:00"
+            }],
+        }
+        self.assertEqual(422, self.request("POST", "/_test/reset", invalid_fixture)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_valid_export_import_round_trip(self):
+        self.assertEqual(201, self.pay(25, "round-trip-payment")[0])
+        before = self.export_document()
+        self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
+        self.assertEqual(before, self.export_document())
 
 
 if __name__ == "__main__":

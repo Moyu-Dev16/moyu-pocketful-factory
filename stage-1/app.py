@@ -58,13 +58,15 @@ def parse_rfc3339(value: str | None) -> datetime | None:
 
 
 def ledger_balances(effective_at: datetime | None = None,
-                    recorded_at: datetime | None = None) -> dict[str, int]:
+                    recorded_at: datetime | None = None,
+                    state: dict | None = None) -> dict[str, int]:
     """只从期初余额与不可变分录重放余额，可按双时态截断。调用方须持有锁。"""
+    source = STATE if state is None else state
     balances = {
         uid: int(user.get("opening_balance", 0))
-        for uid, user in STATE["users"].items()
+        for uid, user in source["users"].items()
     }
-    for entry in STATE["ledger"]:
+    for entry in source["ledger"]:
         effective = parse_rfc3339(entry["effective_at"])
         recorded = parse_rfc3339(entry["recorded_at"])
         if effective_at is not None and (effective is None or effective > effective_at):
@@ -78,13 +80,14 @@ def ledger_balances(effective_at: datetime | None = None,
 def build_transfer_entries(transaction_id: str, from_user_id: str, to_user_id: str,
                            amount: int, effective_at: str, recorded_at: str,
                            *, payment_id: str | None = None,
-                           entry_kind: str = "payment") -> list[dict]:
+                           entry_kind: str = "payment",
+                           currency: str | None = None) -> list[dict]:
     """构造恰好一借一贷的不可变分录对；借贷金额和币种始终一致。"""
     common = {
         "transaction_id": transaction_id,
         "payment_id": payment_id,
         "amount": amount,
-        "currency": STATE["currency"],
+        "currency": STATE["currency"] if currency is None else currency,
         "effective_at": effective_at,
         "recorded_at": recorded_at,
         "kind": entry_kind,
@@ -147,6 +150,167 @@ def commit_transfers(transfers: list[dict]) -> None:
     for uid, balance in proposed.items():
         STATE["users"][uid]["balance"] = balance
     STATE["ledger"].extend(pending_entries)
+
+
+def validate_candidate_state(candidate: dict) -> None:
+    """完整验证候选状态；任何异常都必须发生在全局状态交换之前。"""
+    required = {
+        "currency", "minor_units", "settlement_operator_ids", "users", "by_handle",
+        "by_email", "tokens", "payments", "requests", "ledger", "initial_total",
+        "idempotency"
+    }
+    if not required.issubset(candidate):
+        raise ValueError("missing_state_field")
+    if not isinstance(candidate["currency"], str) or not candidate["currency"]:
+        raise ValueError("invalid_currency")
+    if isinstance(candidate["minor_units"], bool) or not isinstance(candidate["minor_units"], int):
+        raise ValueError("invalid_minor_units")
+    if isinstance(candidate["initial_total"], bool) or not isinstance(candidate["initial_total"], int):
+        raise ValueError("invalid_initial_total")
+    if not all(isinstance(candidate[name], expected) for name, expected in (
+        ("users", dict), ("by_handle", dict), ("by_email", dict), ("tokens", dict),
+        ("payments", list), ("requests", list), ("ledger", list), ("idempotency", dict),
+        ("settlement_operator_ids", set)
+    )):
+        raise ValueError("invalid_state_shape")
+
+    users = candidate["users"]
+    expected_handles = {}
+    expected_emails = {}
+    for uid, user in users.items():
+        if not isinstance(uid, str) or not isinstance(user, dict) or user.get("id") != uid:
+            raise ValueError("invalid_user")
+        if (not isinstance(user.get("handle"), str) or not isinstance(user.get("email"), str)
+                or not isinstance(user.get("password"), str)
+                or not isinstance(user.get("display_name"), str)):
+            raise ValueError("invalid_user")
+        for field in ("balance", "opening_balance"):
+            value = user.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("invalid_balance")
+        handle = user["handle"]
+        email = user["email"].lower()
+        if handle in expected_handles or email in expected_emails:
+            raise ValueError("duplicate_identity")
+        expected_handles[handle] = uid
+        expected_emails[email] = uid
+    if candidate["by_handle"] != expected_handles or candidate["by_email"] != expected_emails:
+        raise ValueError("identity_index_mismatch")
+    if any(uid not in users for uid in candidate["tokens"].values()):
+        raise ValueError("invalid_token_owner")
+    if any(uid not in users for uid in candidate["settlement_operator_ids"]):
+        raise ValueError("invalid_settlement_operator")
+
+    payment_ids = set()
+    for payment in candidate["payments"]:
+        if not isinstance(payment, dict):
+            raise ValueError("invalid_payment")
+        payment_id = payment.get("payment_id")
+        if not isinstance(payment_id, str) or payment_id in payment_ids:
+            raise ValueError("invalid_payment")
+        payment_ids.add(payment_id)
+        if (payment.get("from_user_id") not in users or payment.get("to_user_id") not in users
+                or payment.get("from_user_id") == payment.get("to_user_id")):
+            raise ValueError("invalid_payment_account")
+        if (payment.get("from_handle") != users[payment["from_user_id"]]["handle"]
+                or payment.get("to_handle") != users[payment["to_user_id"]]["handle"]
+                or payment.get("visibility") not in ("public", "private")
+                or not isinstance(payment.get("note"), str)
+                or len(payment["note"]) > 200):
+            raise ValueError("invalid_payment")
+        if not is_valid_amount(payment.get("amount")) or payment.get("currency") != candidate["currency"]:
+            raise ValueError("invalid_payment_amount")
+        for field in ("created_at", "effective_at", "recorded_at"):
+            if parse_rfc3339(payment.get(field)) is None:
+                raise ValueError("invalid_payment_time")
+        revisions = payment.get("revisions")
+        if not isinstance(revisions, list) or not revisions:
+            raise ValueError("invalid_revision")
+        for index, revision in enumerate(revisions, 1):
+            if (not isinstance(revision, dict) or revision.get("revision") != index
+                    or isinstance(revision.get("amount"), bool)
+                    or not isinstance(revision.get("amount"), int)
+                    or not 0 <= revision["amount"] <= 1_000_000_000
+                    or parse_rfc3339(revision.get("effective_at")) is None
+                    or parse_rfc3339(revision.get("recorded_at")) is None):
+                raise ValueError("invalid_revision")
+
+    request_ids = set()
+    for request in candidate["requests"]:
+        if not isinstance(request, dict) or not isinstance(request.get("request_id"), str):
+            raise ValueError("invalid_request")
+        if request["request_id"] in request_ids:
+            raise ValueError("invalid_request")
+        request_ids.add(request["request_id"])
+        if (request.get("requester_id") not in users or request.get("payer_id") not in users
+                or request.get("requester_id") == request.get("payer_id")
+                or not is_valid_amount(request.get("amount"))
+                or request.get("currency") != candidate["currency"]
+                or parse_rfc3339(request.get("created_at")) is None):
+            raise ValueError("invalid_request")
+        if (request.get("requester_handle") != users[request["requester_id"]]["handle"]
+                or request.get("payer_handle") != users[request["payer_id"]]["handle"]
+                or request.get("status") not in ("pending", "paid", "declined", "cancelled")
+                or not isinstance(request.get("note"), str) or len(request["note"]) > 200
+                or (request.get("payment_id") is not None
+                    and request.get("payment_id") not in payment_ids)):
+            raise ValueError("invalid_request")
+
+    for payment in candidate["payments"]:
+        if payment.get("request_id") is not None and payment["request_id"] not in request_ids:
+            raise ValueError("invalid_payment_request")
+
+    transactions = {}
+    entry_ids = set()
+    for entry in candidate["ledger"]:
+        if not isinstance(entry, dict):
+            raise ValueError("invalid_ledger_entry")
+        entry_id = entry.get("entry_id")
+        transaction_id = entry.get("transaction_id")
+        side = entry.get("side")
+        amount = entry.get("amount")
+        if (not isinstance(entry_id, str) or entry_id in entry_ids
+                or not isinstance(transaction_id, str) or not transaction_id
+                or entry.get("account_id") not in users or side not in ("debit", "credit")
+                or not is_valid_amount(amount) or entry.get("currency") != candidate["currency"]
+                or entry.get("delta") != (-int(amount) if side == "debit" else int(amount))
+                or parse_rfc3339(entry.get("effective_at")) is None
+                or parse_rfc3339(entry.get("recorded_at")) is None
+                or entry.get("payment_id") not in payment_ids):
+            raise ValueError("invalid_ledger_entry")
+        entry_ids.add(entry_id)
+        transactions.setdefault(transaction_id, []).append(entry)
+    for entries in transactions.values():
+        if (len(entries) != 2 or {entry["side"] for entry in entries} != {"debit", "credit"}
+                or len({entry["account_id"] for entry in entries}) != 2
+                or len({entry["amount"] for entry in entries}) != 1
+                or len({entry["currency"] for entry in entries}) != 1
+                or sum(entry["delta"] for entry in entries) != 0):
+            raise ValueError("unbalanced_transaction")
+
+    if sum(user["opening_balance"] for user in users.values()) != candidate["initial_total"]:
+        raise ValueError("opening_total_mismatch")
+    if sum(user["balance"] for user in users.values()) != candidate["initial_total"]:
+        raise ValueError("balance_total_mismatch")
+    if ledger_balances(state=candidate) != {uid: user["balance"] for uid, user in users.items()}:
+        raise ValueError("ledger_cache_mismatch")
+
+    historical = {uid: user["opening_balance"] for uid, user in users.items()}
+    by_effective = {}
+    for entry in candidate["ledger"]:
+        by_effective.setdefault(parse_rfc3339(entry["effective_at"]), []).append(entry)
+    for effective in sorted(by_effective):
+        for entry in by_effective[effective]:
+            historical[entry["account_id"]] += entry["delta"]
+        if any(balance < 0 for balance in historical.values()):
+            raise ValueError("historical_overdraft")
+
+    for token, record in candidate["idempotency"].items():
+        if (not isinstance(token, tuple) or len(token) != 4 or token[0] not in users
+                or not all(isinstance(part, str) for part in token)
+                or not isinstance(record, dict) or not isinstance(record.get("canonical_body"), str)
+                or isinstance(record.get("status"), bool) or not isinstance(record.get("status"), int)):
+            raise ValueError("invalid_idempotency_record")
 
 
 def is_valid_amount(val) -> bool:
@@ -303,31 +467,42 @@ class Handler(BaseHTTPRequestHandler):
     # =========================================================================
 
     def handle_reset(self):
+        global STATE
         fixture = self.read_body()
         if fixture is None or not isinstance(fixture, dict):
             return self.fail(400, "malformed_request")
 
-        # Check negative balance in fixture
-        for u in fixture.get("users", []):
-            if u.get("balance", 0) < 0:
-                return self.fail(422, "validation_failed")
+        try:
+            candidate = {
+                "currency": fixture.get("currency", "EUR"),
+                "minor_units": fixture.get("minor_units", 2),
+                "settlement_operator_ids": set(fixture.get("settlement_operator_ids", [])),
+                "users": {}, "by_handle": {}, "by_email": {}, "tokens": {},
+                "payments": [], "requests": [], "ledger": [], "idempotency": {},
+                "initial_total": 0,
+            }
+            users_fixture = fixture.get("users", [])
+            payments_fixture = fixture.get("payments", [])
+            requests_fixture = fixture.get("requests", [])
+            if not all(isinstance(value, list) for value in (
+                    users_fixture, payments_fixture, requests_fixture)):
+                raise ValueError("invalid_fixture_shape")
 
-        with STATE_LOCK:
-            STATE["currency"] = fixture.get("currency", "EUR")
-            STATE["minor_units"] = fixture.get("minor_units", 2)
-            STATE["settlement_operator_ids"] = set(fixture.get("settlement_operator_ids", []))
-            STATE["users"] = {}
-            STATE["by_handle"] = {}
-            STATE["by_email"] = {}
-            STATE["tokens"] = {}
-            STATE["payments"] = []
-            STATE["requests"] = []
-            STATE["ledger"] = []
-            STATE["idempotency"] = {}
-
-            for u in fixture.get("users", []):
+            for u in users_fixture:
+                if not isinstance(u, dict):
+                    raise ValueError("invalid_user")
+                balance = u.get("balance", 0)
+                if isinstance(balance, bool) or not isinstance(balance, int) or balance < 0:
+                    raise ValueError("invalid_balance")
                 uid = u["id"]
+                email = u["email"]
+                handle = u["handle"]
+                if (uid in candidate["users"] or handle in candidate["by_handle"]
+                        or email.lower() in candidate["by_email"]):
+                    raise ValueError("duplicate_identity")
                 raw_pwd = u.get("password", "")
+                if not isinstance(raw_pwd, str):
+                    raise ValueError("invalid_password")
                 if raw_pwd.startswith("scrypt$"):
                     hashed_pwd = raw_pwd
                 else:
@@ -335,20 +510,24 @@ class Handler(BaseHTTPRequestHandler):
                     hashed_pwd = hash_password(raw_pwd, salt=deterministic_salt)
                 user_obj = {
                     "id": uid,
-                    "email": u["email"],
+                    "email": email,
                     "password": hashed_pwd,
                     "display_name": u.get("display_name", u.get("handle", "")),
-                    "handle": u["handle"],
-                    "balance": int(u.get("balance", 0)),
-                    "opening_balance": int(u.get("balance", 0))
+                    "handle": handle,
+                    "balance": balance,
+                    "opening_balance": balance
                 }
-                STATE["users"][uid] = user_obj
-                STATE["by_handle"][user_obj["handle"]] = uid
-                STATE["by_email"][user_obj["email"].lower()] = uid
+                candidate["users"][uid] = user_obj
+                candidate["by_handle"][user_obj["handle"]] = uid
+                candidate["by_email"][user_obj["email"].lower()] = uid
 
-            for p in fixture.get("payments", []):
-                from_u = STATE["users"].get(p["from_user_id"])
-                to_u = STATE["users"].get(p["to_user_id"])
+            for p in payments_fixture:
+                if not isinstance(p, dict) or not is_valid_amount(p.get("amount")):
+                    raise ValueError("invalid_payment")
+                from_u = candidate["users"].get(p["from_user_id"])
+                to_u = candidate["users"].get(p["to_user_id"])
+                if from_u is None or to_u is None:
+                    raise ValueError("invalid_payment_account")
                 pm = {
                     "payment_id": p.get("id") or f"p_{uuid.uuid4().hex[:8]}",
                     "from_user_id": p["from_user_id"],
@@ -356,7 +535,7 @@ class Handler(BaseHTTPRequestHandler):
                     "to_user_id": p["to_user_id"],
                     "to_handle": to_u["handle"] if to_u else "",
                     "amount": int(p["amount"]),
-                    "currency": STATE["currency"],
+                    "currency": candidate["currency"],
                     "note": p.get("note", ""),
                     "visibility": p.get("visibility", "public"),
                     "request_id": p.get("request_id"),
@@ -370,21 +549,25 @@ class Handler(BaseHTTPRequestHandler):
                     "effective_at": pm["effective_at"], "recorded_at": pm["recorded_at"],
                     "reason": ""
                 }]))
-                STATE["payments"].append(pm)
+                candidate["payments"].append(pm)
 
                 # fixture 中 payment 是既有历史，反推出可重放的期初余额并补齐双录分录。
                 created_at = pm["effective_at"]
-                STATE["users"][pm["from_user_id"]]["opening_balance"] += pm["amount"]
-                STATE["users"][pm["to_user_id"]]["opening_balance"] -= pm["amount"]
-                STATE["ledger"].extend(build_transfer_entries(
+                candidate["users"][pm["from_user_id"]]["opening_balance"] += pm["amount"]
+                candidate["users"][pm["to_user_id"]]["opening_balance"] -= pm["amount"]
+                candidate["ledger"].extend(build_transfer_entries(
                     f"tx_seed_{pm['payment_id']}", pm["from_user_id"], pm["to_user_id"],
                     pm["amount"], created_at, pm["recorded_at"], payment_id=pm["payment_id"],
-                    entry_kind="fixture"
+                    entry_kind="fixture", currency=candidate["currency"]
                 ))
 
-            for r in fixture.get("requests", []):
-                req_u = STATE["users"].get(r["requester_id"])
-                payer_u = STATE["users"].get(r["payer_id"])
+            for r in requests_fixture:
+                if not isinstance(r, dict) or not is_valid_amount(r.get("amount")):
+                    raise ValueError("invalid_request")
+                req_u = candidate["users"].get(r["requester_id"])
+                payer_u = candidate["users"].get(r["payer_id"])
+                if req_u is None or payer_u is None:
+                    raise ValueError("invalid_request_account")
                 rq = {
                     "request_id": r.get("id") or f"rq_{uuid.uuid4().hex[:8]}",
                     "requester_id": r["requester_id"],
@@ -392,21 +575,21 @@ class Handler(BaseHTTPRequestHandler):
                     "payer_id": r["payer_id"],
                     "payer_handle": payer_u["handle"] if payer_u else "",
                     "amount": int(r["amount"]),
-                    "currency": STATE["currency"],
+                    "currency": candidate["currency"],
                     "note": r.get("note", ""),
                     "status": r.get("status", "pending"),
                     "payment_id": r.get("payment_id"),
                     "created_at": r.get("created_at") or "2026-09-01T00:00:00+00:00"
                 }
-                STATE["requests"].append(rq)
+                candidate["requests"].append(rq)
 
-            STATE["initial_total"] = sum(u["balance"] for u in STATE["users"].values())
-            if ledger_balances() != {uid: u["balance"] for uid, u in STATE["users"].items()}:
-                return self.fail(422, "validation_failed")
-            try:
-                commit_transfers([])
-            except (ValueError, RuntimeError):
-                return self.fail(422, "validation_failed")
+            candidate["initial_total"] = sum(u["balance"] for u in candidate["users"].values())
+            validate_candidate_state(candidate)
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            STATE = candidate
 
         return self.send_json(204, None)
 
@@ -441,6 +624,7 @@ class Handler(BaseHTTPRequestHandler):
         })
 
     def handle_import(self):
+        global STATE
         body = self.read_body()
         if body is None or not isinstance(body, dict):
             return self.fail(400, "malformed_request")
@@ -452,41 +636,45 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(422, "validation_failed")
 
         s = body["state"]
-        required_keys = ("currency", "minor_units", "users", "by_handle", "by_email", "tokens", "payments", "requests")
+        required_keys = (
+            "currency", "minor_units", "users", "by_handle", "by_email", "tokens",
+            "payments", "requests", "ledger", "initial_total"
+        )
         if not all(k in s for k in required_keys):
             return self.fail(422, "validation_failed")
 
+        try:
+            candidate = {
+                "currency": copy.deepcopy(s["currency"]),
+                "minor_units": copy.deepcopy(s["minor_units"]),
+                "settlement_operator_ids": set(copy.deepcopy(s.get("settlement_operator_ids", []))),
+                "users": copy.deepcopy(s["users"]),
+                "by_handle": copy.deepcopy(s["by_handle"]),
+                "by_email": copy.deepcopy(s["by_email"]),
+                "tokens": copy.deepcopy(s["tokens"]),
+                "payments": copy.deepcopy(s["payments"]),
+                "requests": copy.deepcopy(s["requests"]),
+                "ledger": copy.deepcopy(s["ledger"]),
+                "initial_total": copy.deepcopy(s["initial_total"]),
+                "idempotency": {},
+            }
+            raw_idempotency = s.get("idempotency", {})
+            if not isinstance(raw_idempotency, dict):
+                raise ValueError("invalid_idempotency")
+            for key_text, record in raw_idempotency.items():
+                decoded = json.loads(key_text)
+                if not isinstance(decoded, list):
+                    raise ValueError("invalid_idempotency")
+                token = tuple(decoded)
+                if token in candidate["idempotency"]:
+                    raise ValueError("duplicate_idempotency")
+                candidate["idempotency"][token] = copy.deepcopy(record)
+            validate_candidate_state(candidate)
+        except (KeyError, TypeError, ValueError, RuntimeError, json.JSONDecodeError):
+            return self.fail(422, "validation_failed")
+
         with STATE_LOCK:
-            STATE["currency"] = s["currency"]
-            STATE["minor_units"] = s["minor_units"]
-            STATE["settlement_operator_ids"] = set(s.get("settlement_operator_ids", []))
-            STATE["users"] = copy.deepcopy(s["users"])
-            STATE["by_handle"] = copy.deepcopy(s["by_handle"])
-            STATE["by_email"] = copy.deepcopy(s["by_email"])
-            STATE["tokens"] = copy.deepcopy(s["tokens"])
-            STATE["payments"] = copy.deepcopy(s["payments"])
-            STATE["requests"] = copy.deepcopy(s["requests"])
-            STATE["ledger"] = copy.deepcopy(s.get("ledger", []))
-            STATE["initial_total"] = int(s.get(
-                "initial_total", sum(u["balance"] for u in STATE["users"].values())
-            ))
-
-            for user in STATE["users"].values():
-                user.setdefault("opening_balance", user["balance"])
-
-            cached = {uid: u["balance"] for uid, u in STATE["users"].items()}
-            if STATE["ledger"] and ledger_balances() != cached:
-                return self.fail(422, "validation_failed")
-            if sum(cached.values()) != STATE["initial_total"]:
-                return self.fail(422, "validation_failed")
-
-            STATE["idempotency"] = {}
-            for k_str, v in s.get("idempotency", {}).items():
-                try:
-                    k_tuple = tuple(json.loads(k_str))
-                    STATE["idempotency"][k_tuple] = v
-                except Exception:
-                    pass
+            STATE = candidate
 
         return self.send_json(204, None)
 
