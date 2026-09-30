@@ -284,7 +284,7 @@ def get_user_balances(user_id: str, now_str: str | None = None) -> tuple[int, in
 # Web UI HTML Template (Self-contained SPA with Statement Support)
 # =============================================================================
 
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -395,9 +395,6 @@ INDEX_HTML = """<!DOCTYPE html>
   .badge-declined, .badge-cancelled, .badge-voided { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
   .badge-expired { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
   .split-preview-box { background: #0b1120; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin-top: 1rem; }
-  table.statement-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
-  table.statement-table th, table.statement-table td { padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
-  table.statement-table th { color: var(--text-muted); font-weight: 600; }
 </style>
 </head>
 <body>
@@ -431,780 +428,1015 @@ let latestRefreshSeq = 0;
 
 function getCookie(name) {
   const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
-  return match ? decodeURIComponent(match[2]) : "";
+  return match ? match[2] : "";
 }
 
-function setCookie(name, val) {
-  document.cookie = `${name}=${encodeURIComponent(val)}; Path=/; SameSite=Lax`;
-}
-
-function parseMajorToMinor(valStr) {
-  if (!valStr || typeof valStr !== "string") return null;
-  valStr = valStr.trim();
-  if (currentMinorUnits === 0) {
-    if (!/^\\d+$/.test(valStr)) return null;
-    return parseInt(valStr, 10);
-  }
-  const regex = new RegExp(`^\\\\d+(\\\\.\\\\d{1,${currentMinorUnits}})?$`);
-  if (!regex.test(valStr)) return null;
-  const parts = valStr.split(".");
-  const intPart = parts[0];
-  const decPart = (parts[1] || "").padEnd(currentMinorUnits, "0");
-  return parseInt(intPart + decPart, 10);
-}
-
-function formatMinor(minor) {
-  if (minor === undefined || minor === null) return "0";
-  if (currentMinorUnits === 0) return `${minor} ${currentCurrency}`;
-  const s = String(minor).padStart(currentMinorUnits + 1, "0");
-  const whole = s.slice(0, -currentMinorUnits);
-  const frac = s.slice(-currentMinorUnits);
-  return `${whole}.${frac} ${currentCurrency}`;
-}
-
-async function apiCall(method, path, body, extraHeaders = {}) {
-  const headers = { "Accept": "application/json", ...extraHeaders };
-  if (currentToken) {
-    headers["Authorization"] = `Bearer ${currentToken}`;
-  }
-  let payload = undefined;
-  if (body !== undefined && body !== null) {
-    headers["Content-Type"] = "application/json";
-    payload = JSON.stringify(body);
-  }
-  try {
-    const res = await fetch(path, { method, headers, body: payload });
-    let data = null;
-    try { data = await res.json(); } catch(e) {}
-    return { ok: res.ok, status: res.status, data };
-  } catch (err) {
-    return { ok: false, status: 0, error: err.message };
-  }
-}
-
-async function init() {
-  window.addEventListener("popstate", handleRoute);
-  document.addEventListener("click", e => {
-    const anchor = e.target.closest("a");
-    if (anchor && anchor.origin === window.location.origin && !anchor.hasAttribute("download") && anchor.target !== "_blank") {
-      e.preventDefault();
-      navigateTo(anchor.pathname);
-    }
-  });
-
-  if (currentToken) {
-    const res = await apiCall("GET", "/me");
-    if (res.ok && res.data) {
-      currentUser = res.data;
-      currentCurrency = currentUser.currency;
-      currentMinorUnits = currentUser.minor_units;
-    } else {
-      currentToken = "";
-      localStorage.removeItem("pocketful_token");
-      setCookie("token", "");
-    }
-  }
-  renderHeader();
-  handleRoute();
-}
-
-function navigateTo(path) {
-  window.history.pushState({}, "", path);
-  handleRoute();
-}
-
-function renderHeader() {
-  const headerContainer = document.getElementById("auth-header");
-  if (!headerContainer) return;
-  if (currentUser) {
-    headerContainer.innerHTML = `
-      <div class="user-badge">
-        <span data-testid="current-user">@${currentUser.handle}</span>
-        <button class="btn-sm btn-secondary" id="logout-btn">Log out</button>
-      </div>
-    `;
-    document.getElementById("logout-btn").onclick = () => {
-      currentUser = null;
-      currentToken = "";
-      localStorage.removeItem("pocketful_token");
-      setCookie("token", "");
-      renderHeader();
-      navigateTo("/login");
-    };
+function setToken(token) {
+  currentToken = token;
+  if (token) {
+    localStorage.setItem("pocketful_token", token);
+    document.cookie = "token=" + token + "; path=/; max-age=86400";
   } else {
-    headerContainer.innerHTML = `
-      <div style="display:flex;gap:0.75rem;">
-        <a href="/login" class="btn-sm btn-secondary" style="text-decoration:none;display:inline-block;">Log in</a>
-        <a href="/signup" class="btn-sm" style="text-decoration:none;display:inline-block;">Sign up</a>
+    localStorage.removeItem("pocketful_token");
+    document.cookie = "token=; path=/; max-age=0";
+  }
+}
+
+function formatMoney(minor, minorUnits, currency) {
+  if (minorUnits === 0) return `${minor} ${currency}`;
+  const text = String(minor).padStart(minorUnits + 1, '0');
+  const intPart = text.slice(0, text.length - minorUnits);
+  const fracPart = text.slice(text.length - minorUnits);
+  return `${intPart}.${fracPart} ${currency}`;
+}
+
+function parseDecimalToMinor(valStr, minorUnits) {
+  if (typeof valStr !== 'string') return null;
+  valStr = valStr.trim();
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(valStr)) return null;
+  const parts = valStr.split('.');
+  const intPart = parseInt(parts[0], 10);
+  const fracStr = parts[1] || '';
+  if (fracStr.length > minorUnits) return null; // Non-rounded overflow
+  const paddedFrac = fracStr.padEnd(minorUnits, '0');
+  const fracPart = minorUnits > 0 ? parseInt(paddedFrac, 10) : 0;
+  const total = intPart * Math.pow(10, minorUnits) + fracPart;
+  if (total < 1 || total > 1000000000) return null;
+  return total;
+}
+
+async function apiRequest(path, options = {}) {
+  options.headers = options.headers || {};
+  if (currentToken) {
+    options.headers["Authorization"] = "Bearer " + currentToken;
+  }
+  if (options.body && typeof options.body === 'object') {
+    options.headers["Content-Type"] = "application/json";
+    options.body = JSON.stringify(options.body);
+  }
+  return fetch(path, options);
+}
+
+function logout() {
+  setToken("");
+  currentUser = null;
+  updateHeaderAuth();
+  navigate("/login");
+}
+
+function navigate(url) {
+  window.history.pushState({}, "", url);
+  route();
+}
+
+window.addEventListener("popstate", route);
+
+async function route() {
+  const path = window.location.pathname;
+  updateNav();
+
+  if (!currentToken && path !== "/login" && path !== "/signup") {
+    navigate("/login");
+    return;
+  }
+
+  if (currentToken && !currentUser) {
+    try {
+      const res = await apiRequest("/me");
+      if (res.ok) {
+        currentUser = await res.json();
+        currentCurrency = currentUser.currency;
+        currentMinorUnits = currentUser.minor_units;
+      } else {
+        setToken("");
+        navigate("/login");
+        return;
+      }
+    } catch (e) {
+      // offline / retryable
+    }
+  }
+
+  updateHeaderAuth();
+
+  const root = document.getElementById("app-root");
+  if (path === "/login") {
+    renderLogin(root);
+  } else if (path === "/signup") {
+    renderSignup(root);
+  } else if (path === "/requests") {
+    renderRequests(root);
+  } else if (path === "/split") {
+    renderSplit(root);
+  } else if (path === "/authorizations") {
+    renderAuthorizations(root);
+  } else if (path === "/statement") {
+    renderStatement(root);
+  } else {
+    renderWallet(root);
+  }
+}
+
+function updateNav() {
+  const path = window.location.pathname;
+  document.querySelectorAll("nav a").forEach(a => {
+    a.classList.toggle("active", a.getAttribute("href") === path);
+  });
+}
+
+function updateHeaderAuth() {
+  const container = document.getElementById("auth-header");
+  if (!container) return;
+  if (currentUser) {
+    container.innerHTML = `
+      <div class="user-badge">
+        <span>Signed in as <strong data-testid="current-user">${currentUser.display_name}</strong> (<span data-testid="current-handle">${currentUser.handle}</span>)</span>
+        <button class="btn-sm btn-secondary" data-testid="logout-button" onclick="logout()">Sign out</button>
+      </div>
+    `;
+  } else {
+    container.innerHTML = `
+      <div id="logged-out-view">
+        <a href="/login" style="color:var(--primary);text-decoration:none;font-weight:600;margin-right:1rem;">Sign in</a>
+        <a href="/signup" style="color:var(--text-muted);text-decoration:none;">Sign up</a>
       </div>
     `;
   }
 }
 
-function handleRoute() {
-  const path = window.location.pathname;
-  document.querySelectorAll("#nav-links a").forEach(el => {
-    el.classList.toggle("active", el.getAttribute("href") === path);
-  });
+// ----------------------------------------------------------------------------
+// Screens: Login & Signup
+// ----------------------------------------------------------------------------
 
-  if (!currentUser && path !== "/login" && path !== "/signup") {
-    navigateTo("/login");
-    return;
-  }
-  if (currentUser && (path === "/login" || path === "/signup")) {
-    navigateTo("/");
-    return;
-  }
-
-  if (path === "/login") renderLogin();
-  else if (path === "/signup") renderSignup();
-  else if (path === "/requests") renderRequests();
-  else if (path === "/split") renderSplit();
-  else if (path === "/authorizations") renderAuthorizations();
-  else if (path === "/statement") renderStatement();
-  else renderWallet();
-}
-
-function renderLogin() {
-  const root = document.getElementById("app-root");
+function renderLogin(root) {
   root.innerHTML = `
-    <div class="card" style="max-width:420px;margin:2rem auto;">
-      <h2>Log in to Pocketful</h2>
-      <div id="login-error" class="error-box" style="display:none;"></div>
-      <form id="login-form">
+    <div class="card" style="max-width:400px;margin:2rem auto;">
+      <h2>Sign in to Pocketful</h2>
+      <div id="login-error-container"></div>
+      <form onsubmit="handleLoginSubmit(event)">
         <div class="form-group">
           <label>Email</label>
-          <input type="email" id="login-email" required autocomplete="email">
+          <input type="email" data-testid="login-email" required>
         </div>
         <div class="form-group">
           <label>Password</label>
-          <input type="password" id="login-password" required autocomplete="current-password">
+          <input type="password" data-testid="login-password" required>
         </div>
-        <button type="submit" style="width:100%;">Log in</button>
+        <button type="submit" data-testid="login-submit" style="width:100%;">Sign In</button>
       </form>
     </div>
   `;
-  document.getElementById("login-form").onsubmit = async e => {
-    e.preventDefault();
-    const email = document.getElementById("login-email").value.trim();
-    const password = document.getElementById("login-password").value;
-    const errBox = document.getElementById("login-error");
-    errBox.style.display = "none";
-    const res = await apiCall("POST", "/auth/login", { email, password });
-    if (res.ok && res.data) {
-      currentToken = res.data.token;
-      localStorage.setItem("pocketful_token", currentToken);
-      setCookie("token", currentToken);
-      const meRes = await apiCall("GET", "/me");
-      if (meRes.ok) {
-        currentUser = meRes.data;
-        currentCurrency = currentUser.currency;
-        currentMinorUnits = currentUser.minor_units;
-      }
-      renderHeader();
-      navigateTo("/");
-    } else {
-      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Login failed";
-      errBox.style.display = "block";
-    }
-  };
 }
 
-function renderSignup() {
-  const root = document.getElementById("app-root");
+async function handleLoginSubmit(e) {
+  e.preventDefault();
+  const email = document.querySelector('[data-testid="login-email"]').value;
+  const password = document.querySelector('[data-testid="login-password"]').value;
+  const errContainer = document.getElementById("login-error-container");
+  errContainer.innerHTML = "";
+
+  try {
+    const res = await apiRequest("/auth/login", {
+      method: "POST",
+      body: { email, password }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setToken(data.token);
+      currentUser = null;
+      navigate("/");
+    } else {
+      errContainer.innerHTML = `<div class="error-box" data-testid="auth-error">Invalid email or password</div>`;
+    }
+  } catch (err) {
+    errContainer.innerHTML = `<div class="error-box" data-testid="auth-error">Network error. Please try again.</div>`;
+  }
+}
+
+function renderSignup(root) {
   root.innerHTML = `
-    <div class="card" style="max-width:420px;margin:2rem auto;">
-      <h2>Create an Account</h2>
-      <div id="signup-error" class="error-box" style="display:none;"></div>
-      <form id="signup-form">
+    <div class="card" style="max-width:400px;margin:2rem auto;">
+      <h2>Create your account</h2>
+      <div id="signup-error-container"></div>
+      <form onsubmit="handleSignupSubmit(event)">
+        <div class="form-group">
+          <label>Display Name</label>
+          <input type="text" data-testid="signup-display-name" required>
+        </div>
         <div class="form-group">
           <label>Email</label>
-          <input type="email" id="signup-email" required>
-        </div>
-        <div class="form-group">
-          <label>Handle (optional)</label>
-          <input type="text" id="signup-handle" placeholder="letters, numbers, _">
-        </div>
-        <div class="form-group">
-          <label>Display Name (optional)</label>
-          <input type="text" id="signup-display-name">
+          <input type="email" data-testid="signup-email" required>
         </div>
         <div class="form-group">
           <label>Password</label>
-          <input type="password" id="signup-password" required>
+          <input type="password" data-testid="signup-password" required>
         </div>
-        <button type="submit" style="width:100%;">Sign up</button>
+        <button type="submit" data-testid="signup-submit" style="width:100%;">Create Account</button>
       </form>
     </div>
   `;
-  document.getElementById("signup-form").onsubmit = async e => {
-    e.preventDefault();
-    const email = document.getElementById("signup-email").value.trim();
-    const handle = document.getElementById("signup-handle").value.trim() || undefined;
-    const display_name = document.getElementById("signup-display-name").value.trim() || undefined;
-    const password = document.getElementById("signup-password").value;
-    const errBox = document.getElementById("signup-error");
-    errBox.style.display = "none";
-    const res = await apiCall("POST", "/auth/signup", { email, handle, display_name, password });
-    if (res.ok && res.data) {
-      currentToken = res.data.token;
-      localStorage.setItem("pocketful_token", currentToken);
-      setCookie("token", currentToken);
-      const meRes = await apiCall("GET", "/me");
-      if (meRes.ok) {
-        currentUser = meRes.data;
-        currentCurrency = currentUser.currency;
-        currentMinorUnits = currentUser.minor_units;
-      }
-      renderHeader();
-      navigateTo("/");
-    } else {
-      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Signup failed";
-      errBox.style.display = "block";
-    }
-  };
 }
 
-async function renderWallet() {
-  const root = document.getElementById("app-root");
+async function handleSignupSubmit(e) {
+  e.preventDefault();
+  const display_name = document.querySelector('[data-testid="signup-display-name"]').value;
+  const email = document.querySelector('[data-testid="signup-email"]').value;
+  const password = document.querySelector('[data-testid="signup-password"]').value;
+  const errContainer = document.getElementById("signup-error-container");
+  errContainer.innerHTML = "";
+
+  try {
+    const res = await apiRequest("/auth/signup", {
+      method: "POST",
+      body: { email, password, display_name }
+    });
+    if (res.ok) {
+      const data = await res.json();
+      setToken(data.token);
+      currentUser = null;
+      navigate("/");
+    } else {
+      errContainer.innerHTML = `<div class="error-box" data-testid="auth-error">Signup failed</div>`;
+    }
+  } catch (err) {
+    errContainer.innerHTML = `<div class="error-box" data-testid="auth-error">Network error</div>`;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Screen: Wallet (Balance, Pay, Request, Activity Feed)
+// ----------------------------------------------------------------------------
+
+function renderWallet(root) {
+  const initTot = currentUser ? (currentUser.balance ?? currentUser.total ?? 0) : 0;
+  const initAvail = currentUser ? (currentUser.available ?? initTot) : 0;
+  const initBalStr = formatMoney(initTot, currentMinorUnits, currentCurrency);
+  const initAvailStr = formatMoney(initAvail, currentMinorUnits, currentCurrency);
+
   root.innerHTML = `
     <div class="card balance-card">
-      <div class="balance-label">Total Balance</div>
-      <div class="balance-headline" data-testid="balance-headline">${formatMinor(currentUser.balance)}</div>
+      <div class="balance-label">Available to Spend</div>
+      <div class="balance-headline" data-testid="wallet-available" data-amount="${initAvail}">${initAvailStr}</div>
       <div class="balance-secondary">
-        <div>Available: <strong data-testid="balance-available">${formatMinor(currentUser.available)}</strong></div>
-        <div>Held: <strong data-testid="balance-held">${formatMinor(currentUser.held)}</strong></div>
+        <div>Total: <span data-testid="wallet-balance" data-amount="${initTot}">${initBalStr}</span></div>
+        <div id="wallet-held-container"></div>
+      </div>
+      <div style="margin-top:1.25rem;">
+        <button class="btn-sm btn-secondary" data-testid="wallet-refresh" onclick="refreshWallet()">Refresh Balance</button>
       </div>
     </div>
 
     <div class="grid-2">
+      <!-- Pay Form -->
       <div class="card">
-        <h3>Send a Payment</h3>
-        <div id="pay-error" class="error-box" style="display:none;"></div>
-        <div id="pay-uncertain" class="uncertain-box" style="display:none;">Network failure. Payment may be pending. Check activity before retrying.</div>
-        <form id="pay-form">
+        <h3>Pay</h3>
+        <div id="pay-feedback"></div>
+        <form onsubmit="handlePaySubmit(event)">
           <div class="form-group">
             <label>Recipient Handle</label>
-            <input type="text" id="pay-to-handle" data-testid="pay-recipient" required placeholder="handle">
+            <input type="text" data-testid="pay-handle" oninput="onPayFieldChanged()" required>
           </div>
           <div class="form-group">
             <label>Amount (${currentCurrency})</label>
-            <input type="text" id="pay-amount-input" data-testid="pay-amount" required placeholder="0.00">
+            <input type="text" data-testid="pay-amount" placeholder="e.g. 15.00" oninput="onPayFieldChanged()" required>
           </div>
           <div class="form-group">
-            <label>Note (optional)</label>
-            <input type="text" id="pay-note-input" data-testid="pay-note" placeholder="What's this for?">
+            <label>Note</label>
+            <input type="text" data-testid="pay-note" oninput="onPayFieldChanged()">
           </div>
-          <button type="submit" id="pay-submit-btn" data-testid="pay-submit" style="width:100%;">Pay</button>
+          <div class="form-group">
+            <label>Visibility</label>
+            <select data-testid="pay-visibility" onchange="onPayFieldChanged()">
+              <option value="public" selected>Public</option>
+              <option value="private">Private</option>
+            </select>
+          </div>
+          <button type="submit" data-testid="pay-submit" style="width:100%;">Send Payment</button>
         </form>
       </div>
 
+      <!-- Request Form -->
       <div class="card">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
-          <h3 style="margin-bottom:0;">Recent Activity</h3>
-          <button class="btn-sm btn-secondary" id="refresh-activity-btn" data-testid="refresh-feed">Refresh</button>
-        </div>
-        <div id="activity-list" data-testid="activity-feed">Loading...</div>
+        <h3>Request Money</h3>
+        <div id="request-feedback"></div>
+        <form onsubmit="handleRequestSubmit(event)">
+          <div class="form-group">
+            <label>Payer Handle</label>
+            <input type="text" data-testid="request-handle" required>
+          </div>
+          <div class="form-group">
+            <label>Amount (${currentCurrency})</label>
+            <input type="text" data-testid="request-amount" placeholder="e.g. 15.00" required>
+          </div>
+          <div class="form-group">
+            <label>Note</label>
+            <input type="text" data-testid="request-note">
+          </div>
+          <button type="submit" data-testid="request-submit" style="width:100%;">Create Request</button>
+        </form>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Activity Feed</h3>
+      <div id="activity-container">
+        <div class="empty-state" data-testid="empty-activity">No payments yet</div>
       </div>
     </div>
   `;
 
-  payFormKey = crypto.randomUUID();
-  payFormSnapshot = null;
-
-  const toInput = document.getElementById("pay-to-handle");
-  const amtInput = document.getElementById("pay-amount-input");
-  const noteInput = document.getElementById("pay-note-input");
-
-  function onFormChange() {
-    const currentSnap = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
-    if (payFormSnapshot !== null && currentSnap !== payFormSnapshot) {
-      payFormKey = crypto.randomUUID();
-      payFormSnapshot = null;
-    }
-  }
-  toInput.oninput = onFormChange;
-  amtInput.oninput = onFormChange;
-  noteInput.oninput = onFormChange;
-
-  document.getElementById("pay-form").onsubmit = async e => {
-    e.preventDefault();
-    const to_handle = toInput.value.trim().replace(/^@/, "");
-    const minorAmt = parseMajorToMinor(amtInput.value);
-    const note = noteInput.value.trim();
-    const errBox = document.getElementById("pay-error");
-    const uncBox = document.getElementById("pay-uncertain");
-    errBox.style.display = "none";
-    uncBox.style.display = "none";
-
-    if (minorAmt === null || minorAmt <= 0) {
-      errBox.textContent = "Please enter a valid amount.";
-      errBox.style.display = "block";
-      return;
-    }
-
-    payFormSnapshot = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
-    const submitBtn = document.getElementById("pay-submit-btn");
-    submitBtn.disabled = true;
-
-    const res = await apiCall("POST", "/payments", {
-      to_handle,
-      amount: minorAmt,
-      note: note || undefined
-    }, { "Idempotency-Key": payFormKey });
-
-    submitBtn.disabled = false;
-
-    if (res.ok) {
-      payFormKey = crypto.randomUUID();
-      payFormSnapshot = null;
-      toInput.value = "";
-      amtInput.value = "";
-      noteInput.value = "";
-      await refreshWalletData();
-    } else if (res.status === 0) {
-      uncBox.style.display = "block";
-    } else {
-      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Payment failed";
-      errBox.style.display = "block";
-    }
-  };
-
-  document.getElementById("refresh-activity-btn").onclick = refreshWalletData;
-  await loadActivity();
+  refreshWallet();
 }
 
-async function refreshWalletData() {
-  const seq = ++latestRefreshSeq;
-  const meRes = await apiCall("GET", "/me");
-  if (seq === latestRefreshSeq && meRes.ok) {
-    currentUser = meRes.data;
-    const headline = document.querySelector('[data-testid="balance-headline"]');
-    const avail = document.querySelector('[data-testid="balance-available"]');
-    const held = document.querySelector('[data-testid="balance-held"]');
-    if (headline) headline.textContent = formatMinor(currentUser.balance);
-    if (avail) avail.textContent = formatMinor(currentUser.available);
-    if (held) held.textContent = formatMinor(currentUser.held);
-  }
-  await loadActivity(seq);
+function getPayFormSnapshot() {
+  const h = document.querySelector('[data-testid="pay-handle"]')?.value || "";
+  const a = document.querySelector('[data-testid="pay-amount"]')?.value || "";
+  const n = document.querySelector('[data-testid="pay-note"]')?.value || "";
+  const v = document.querySelector('[data-testid="pay-visibility"]')?.value || "public";
+  return JSON.stringify({h, a, n, v});
 }
 
-async function loadActivity(seq = 0) {
-  const container = document.getElementById("activity-list");
-  if (!container) return;
-  const res = await apiCall("GET", "/activity?limit=20");
-  if (seq !== 0 && seq !== latestRefreshSeq) return;
-  if (!res.ok || !res.data || !res.data.payments) {
-    container.innerHTML = `<div class="empty-state">Unable to load activity.</div>`;
-    return;
+function onPayFieldChanged() {
+  const currentSnap = getPayFormSnapshot();
+  if (currentSnap !== payFormSnapshot) {
+    payFormKey = crypto.randomUUID();
+    payFormSnapshot = currentSnap;
   }
-  const payments = res.data.payments;
-  if (payments.length === 0) {
-    container.innerHTML = `<div class="empty-state">No payments yet.</div>`;
-    return;
-  }
-  container.innerHTML = payments.map(p => {
-    const isSender = (p.from_user_id === currentUser.user_id);
-    const sign = isSender ? "-" : "+";
-    const color = isSender ? "var(--text)" : "var(--success)";
-    const counterparty = isSender ? `@${p.to_handle}` : `@${p.from_handle}`;
-    const desc = isSender ? `Paid ${counterparty}` : `Received from ${counterparty}`;
-    return `
-      <div class="list-item" data-testid="activity-item">
-        <div>
-          <div style="font-weight:600;">${desc}</div>
-          <div style="font-size:0.8rem;color:var(--text-muted);">${p.note || "No memo"}</div>
-        </div>
-        <div style="font-weight:700;color:${color};">
-          ${sign}${formatMinor(p.amount)}
-        </div>
-      </div>
-    `;
-  }).join("");
 }
 
-async function renderRequests() {
-  const root = document.getElementById("app-root");
-  root.innerHTML = `
-    <div class="grid-2">
-      <div class="card">
-        <h3>Incoming Requests</h3>
-        <div id="incoming-requests-list">Loading...</div>
-      </div>
-      <div class="card">
-        <h3>Outgoing Requests</h3>
-        <div id="outgoing-requests-list">Loading...</div>
-      </div>
-    </div>
-  `;
-  await Promise.all([loadRequests("incoming"), loadRequests("outgoing")]);
-}
+async function refreshWallet() {
+  try {
+    const [meRes, actRes] = await Promise.all([
+      apiRequest("/me"),
+      apiRequest("/activity?limit=100")
+    ]);
 
-async function loadRequests(direction) {
-  const container = document.getElementById(`${direction}-requests-list`);
-  if (!container) return;
-  const res = await apiCall("GET", `/requests?direction=${direction}`);
-  if (!res.ok || !res.data || !res.data.requests) {
-    container.innerHTML = `<div class="empty-state">Unable to load requests.</div>`;
-    return;
-  }
-  const requests = res.data.requests;
-  if (requests.length === 0) {
-    container.innerHTML = `<div class="empty-state">No ${direction} requests.</div>`;
-    return;
-  }
-  container.innerHTML = requests.map(r => {
-    const other = direction === "incoming" ? `@${r.requester_handle}` : `@${r.payer_handle}`;
-    let actions = "";
-    if (r.status === "pending") {
-      if (direction === "incoming") {
-        actions = `
-          <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
-            <button class="btn-sm" onclick="payRequest('${r.request_id}')">Pay</button>
-            <button class="btn-sm btn-secondary" onclick="declineRequest('${r.request_id}')">Decline</button>
-          </div>
-        `;
-      } else {
-        actions = `
-          <div style="margin-top:0.5rem;">
-            <button class="btn-sm btn-danger" onclick="cancelRequest('${r.request_id}')">Cancel</button>
-          </div>
-        `;
+    if (meRes.ok) {
+      const me = await meRes.json();
+      currentUser = me;
+      currentCurrency = me.currency;
+      currentMinorUnits = me.minor_units;
+      updateHeaderAuth();
+
+      const elAvail = document.querySelector('[data-testid="wallet-available"]');
+      const elBal = document.querySelector('[data-testid="wallet-balance"]');
+      const heldContainer = document.getElementById("wallet-held-container");
+
+      if (elAvail) {
+        elAvail.textContent = formatMoney(me.available, me.minor_units, me.currency);
+        elAvail.setAttribute("data-amount", String(me.available));
+      }
+      if (elBal) {
+        elBal.textContent = formatMoney(me.total, me.minor_units, me.currency);
+        elBal.setAttribute("data-amount", String(me.total));
+      }
+      if (heldContainer) {
+        if (me.held > 0) {
+          heldContainer.innerHTML = `Held: <span data-testid="wallet-held" data-amount="${me.held}">${formatMoney(me.held, me.minor_units, me.currency)}</span>`;
+        } else {
+          heldContainer.innerHTML = "";
+        }
       }
     }
-    return `
-      <div class="list-item" style="flex-direction:column;align-items:stretch;gap:0.5rem;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
-          <div>
-            <strong>${other}</strong> requested <strong>${formatMinor(r.amount)}</strong>
-            <div style="font-size:0.8rem;color:var(--text-muted);">${r.note || "No memo"}</div>
-          </div>
-          <span class="badge badge-${r.status}">${r.status}</span>
-        </div>
-        ${actions}
-      </div>
-    `;
-  }).join("");
+
+    if (actRes.ok) {
+      const act = await actRes.json();
+      renderActivityFeed(act.payments || []);
+    }
+  } catch (err) {}
 }
 
-window.payRequest = async function(reqId) {
-  const key = crypto.randomUUID();
-  const res = await apiCall("POST", `/requests/${reqId}/pay`, {}, { "Idempotency-Key": key });
-  if (res.ok) {
-    renderRequests();
-  } else {
-    alert((res.data && res.data.error && res.data.error.code) || "Failed to pay request");
+function renderActivityFeed(payments) {
+  const container = document.getElementById("activity-container");
+  if (!container) return;
+  if (payments.length === 0) {
+    container.innerHTML = `<div class="empty-state" data-testid="empty-activity">No activity yet</div>`;
+    return;
   }
-};
 
-window.declineRequest = async function(reqId) {
-  const res = await apiCall("POST", `/requests/${reqId}/decline`);
-  if (res.ok) renderRequests();
-  else alert((res.data && res.data.error && res.data.error.code) || "Failed to decline");
-};
+  let html = `<div data-testid="activity-list">`;
+  for (const p of payments) {
+    html += `
+      <div class="list-item" data-testid="activity-item-${p.payment_id}" data-visibility="${p.visibility}">
+        <div>
+          <div style="font-weight:600;" data-testid="activity-parties-${p.payment_id}">${p.from_handle} &rarr; ${p.to_handle}</div>
+          <div style="font-size:0.85rem;color:var(--text-muted);" data-testid="activity-note-${p.payment_id}">${p.note || ""}</div>
+        </div>
+        <div style="text-align:right;">
+          <div style="font-weight:700;" data-testid="activity-amount-${p.payment_id}">${formatMoney(p.amount, currentMinorUnits, currentCurrency)}</div>
+          <span class="badge ${p.visibility === 'private' ? 'badge-pending' : 'badge-paid'}">${p.visibility}</span>
+        </div>
+      </div>
+    `;
+  }
+  html += `</div>`;
+  container.innerHTML = html;
+}
 
-window.cancelRequest = async function(reqId) {
-  const res = await apiCall("POST", `/requests/${reqId}/cancel`);
-  if (res.ok) renderRequests();
-  else alert((res.data && res.data.error && res.data.error.code) || "Failed to cancel");
-};
+async function handlePaySubmit(e) {
+  e.preventDefault();
+  const feedback = document.getElementById("pay-feedback");
+  const handle = document.querySelector('[data-testid="pay-handle"]').value.trim();
+  const amountStr = document.querySelector('[data-testid="pay-amount"]').value.trim();
+  const note = document.querySelector('[data-testid="pay-note"]').value;
+  const visibility = document.querySelector('[data-testid="pay-visibility"]').value;
 
-function renderSplit() {
-  const root = document.getElementById("app-root");
+  const minor = parseDecimalToMinor(amountStr, currentMinorUnits);
+  if (minor === null) {
+    feedback.innerHTML = `<div class="error-box" data-testid="pay-error">Invalid amount</div>`;
+    return;
+  }
+
+  if (!payFormKey) {
+    payFormKey = crypto.randomUUID();
+    payFormSnapshot = getPayFormSnapshot();
+  }
+
+  try {
+    const res = await apiRequest("/payments", {
+      method: "POST",
+      headers: { "Idempotency-Key": payFormKey },
+      body: { to_handle: handle, amount: minor, note, visibility }
+    });
+
+    if (res.ok) {
+      feedback.innerHTML = "";
+      if (currentUser) {
+        currentUser.balance = (currentUser.balance || 0) - minor;
+        currentUser.total = (currentUser.total || 0) - minor;
+        currentUser.available = (currentUser.available || 0) - minor;
+        const elAvail = document.querySelector('[data-testid="wallet-available"]');
+        const elBal = document.querySelector('[data-testid="wallet-balance"]');
+        if (elAvail) {
+          elAvail.textContent = formatMoney(currentUser.available, currentMinorUnits, currentCurrency);
+          elAvail.setAttribute("data-amount", String(currentUser.available));
+        }
+        if (elBal) {
+          elBal.textContent = formatMoney(currentUser.total, currentMinorUnits, currentCurrency);
+          elBal.setAttribute("data-amount", String(currentUser.total));
+        }
+      }
+      await refreshWallet();
+    } else {
+      const err = await res.json();
+      feedback.innerHTML = `<div class="error-box" data-testid="pay-error">${err.error?.code || 'Payment failed'}</div>`;
+      await refreshWallet();
+    }
+  } catch (err) {
+    feedback.innerHTML = `<div class="uncertain-box" data-testid="pay-uncertain">Payment status uncertain. You may retry.</div>`;
+  }
+}
+
+async function handleRequestSubmit(e) {
+  e.preventDefault();
+  const feedback = document.getElementById("request-feedback");
+  const handle = document.querySelector('[data-testid="request-handle"]').value.trim();
+  const amountStr = document.querySelector('[data-testid="request-amount"]').value.trim();
+  const note = document.querySelector('[data-testid="request-note"]').value;
+
+  const minor = parseDecimalToMinor(amountStr, currentMinorUnits);
+  if (minor === null) {
+    feedback.innerHTML = `<div class="error-box" data-testid="request-error">Invalid amount</div>`;
+    return;
+  }
+
+  try {
+    const res = await apiRequest("/requests", {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: { payer_handle: handle, amount: minor, note }
+    });
+
+    if (res.ok) {
+      feedback.innerHTML = "";
+      document.querySelector('[data-testid="request-handle"]').value = "";
+      document.querySelector('[data-testid="request-amount"]').value = "";
+      document.querySelector('[data-testid="request-note"]').value = "";
+    } else {
+      const err = await res.json();
+      feedback.innerHTML = `<div class="error-box" data-testid="request-error">${err.error?.code || 'Request failed'}</div>`;
+    }
+  } catch (err) {
+    feedback.innerHTML = `<div class="error-box" data-testid="request-error">Network error</div>`;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Screen: Requests
+// ----------------------------------------------------------------------------
+
+function renderRequests(root) {
   root.innerHTML = `
-    <div class="card" style="max-width:550px;margin:1rem auto;">
-      <h2>Split an Expense</h2>
-      <div id="split-error" class="error-box" style="display:none;"></div>
-      <form id="split-form">
+    <div class="card">
+      <h2>Requests</h2>
+      <div id="request-action-error"></div>
+      <div id="requests-display">
+        <div class="grid-2">
+          <div>
+            <h3>Incoming</h3>
+            <div id="incoming-container" data-testid="incoming-list"></div>
+          </div>
+          <div>
+            <h3>Outgoing</h3>
+            <div id="outgoing-container" data-testid="outgoing-list"></div>
+          </div>
+        </div>
+      </div>
+      <div id="empty-requests-container"></div>
+    </div>
+  `;
+  refreshRequests();
+}
+
+async function refreshRequests() {
+  try {
+    const res = await apiRequest("/requests?limit=100");
+    if (!res.ok) return;
+    const data = await res.json();
+    const reqs = data.requests || [];
+
+    const incoming = reqs.filter(r => r.payer_id === currentUser.user_id);
+    const outgoing = reqs.filter(r => r.requester_id === currentUser.user_id);
+
+    const emptyContainer = document.getElementById("empty-requests-container");
+    const display = document.getElementById("requests-display");
+
+    if (incoming.length === 0 && outgoing.length === 0) {
+      if (emptyContainer) emptyContainer.innerHTML = `<div class="empty-state" data-testid="empty-requests">No requests</div>`;
+      if (display) display.style.display = "block";
+    } else {
+      if (emptyContainer) emptyContainer.innerHTML = "";
+      if (display) display.style.display = "block";
+    }
+
+    const inContainer = document.getElementById("incoming-container");
+    const outContainer = document.getElementById("outgoing-container");
+
+    if (inContainer) {
+      inContainer.innerHTML = incoming.map(r => `
+        <div class="list-item" data-testid="request-item-${r.request_id}" data-status="${r.status}">
+          <div>
+            <div>From <strong>@${r.requester_handle}</strong></div>
+            <div style="font-weight:700;" data-testid="request-amount-${r.request_id}">${formatMoney(r.amount, currentMinorUnits, currentCurrency)}</div>
+            <div style="font-size:0.85rem;color:var(--text-muted);">${r.note || ""}</div>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center;">
+            <span class="badge badge-${r.status}">${r.status}</span>
+            ${r.status === 'pending' ? `
+              <button class="btn-sm" data-testid="request-pay-${r.request_id}" onclick="actRequestPay('${r.request_id}')">Pay</button>
+              <button class="btn-sm btn-secondary" data-testid="request-decline-${r.request_id}" onclick="actRequestDecline('${r.request_id}')">Decline</button>
+            ` : ''}
+          </div>
+        </div>
+      `).join("");
+    }
+
+    if (outContainer) {
+      outContainer.innerHTML = outgoing.map(r => `
+        <div class="list-item" data-testid="request-item-${r.request_id}" data-status="${r.status}">
+          <div>
+            <div>To <strong>@${r.payer_handle}</strong></div>
+            <div style="font-weight:700;" data-testid="request-amount-${r.request_id}">${formatMoney(r.amount, currentMinorUnits, currentCurrency)}</div>
+            <div style="font-size:0.85rem;color:var(--text-muted);">${r.note || ""}</div>
+          </div>
+          <div style="display:flex;gap:0.5rem;align-items:center;">
+            <span class="badge badge-${r.status}">${r.status}</span>
+            ${r.status === 'pending' ? `
+              <button class="btn-sm btn-danger" data-testid="request-cancel-${r.request_id}" onclick="actRequestCancel('${r.request_id}')">Cancel</button>
+            ` : ''}
+          </div>
+        </div>
+      `).join("");
+    }
+  } catch (err) {}
+}
+
+async function actRequestPay(id) {
+  const errBox = document.getElementById("request-action-error");
+  errBox.innerHTML = "";
+  try {
+    const res = await apiRequest(`/requests/${id}/pay`, {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: {}
+    });
+    if (res.ok) {
+      await refreshRequests();
+    } else {
+      errBox.innerHTML = `<div class="error-box" data-testid="request-error">Payment refused</div>`;
+      await refreshRequests();
+    }
+  } catch (e) {
+    errBox.innerHTML = `<div class="error-box" data-testid="request-error">Network error</div>`;
+  }
+}
+
+async function actRequestDecline(id) {
+  const errBox = document.getElementById("request-action-error");
+  errBox.innerHTML = "";
+  try {
+    const res = await apiRequest(`/requests/${id}/decline`, { method: "POST" });
+    if (res.ok) {
+      await refreshRequests();
+    } else {
+      errBox.innerHTML = `<div class="error-box" data-testid="request-error">Decline refused</div>`;
+      await refreshRequests();
+    }
+  } catch (e) {
+    errBox.innerHTML = `<div class="error-box" data-testid="request-error">Network error</div>`;
+  }
+}
+
+async function actRequestCancel(id) {
+  const errBox = document.getElementById("request-action-error");
+  errBox.innerHTML = "";
+  try {
+    const res = await apiRequest(`/requests/${id}/cancel`, { method: "POST" });
+    if (res.ok) {
+      await refreshRequests();
+    } else {
+      errBox.innerHTML = `<div class="error-box" data-testid="request-error">Cancel refused</div>`;
+      await refreshRequests();
+    }
+  } catch (e) {
+    errBox.innerHTML = `<div class="error-box" data-testid="request-error">Network error</div>`;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Screen: Split Form
+// ----------------------------------------------------------------------------
+
+function renderSplit(root) {
+  root.innerHTML = `
+    <div class="card" style="max-width:550px;margin:2rem auto;">
+      <h2>Split a Bill</h2>
+      <div id="split-feedback"></div>
+      <form onsubmit="handleSplitSubmit(event)">
         <div class="form-group">
           <label>Total Amount (${currentCurrency})</label>
-          <input type="text" id="split-amount" required placeholder="0.00">
+          <input type="text" data-testid="split-amount" placeholder="e.g. 30.00" oninput="updateSplitPreview()" required>
         </div>
         <div class="form-group">
-          <label>Participant Handles (comma-separated, including yourself)</label>
-          <input type="text" id="split-handles" required placeholder="ada, bob, cy" value="${currentUser ? currentUser.handle : ''}">
+          <label>Participants (comma-separated handles in order)</label>
+          <input type="text" data-testid="split-handles" placeholder="e.g. ada, bob, cy" oninput="updateSplitPreview()" required>
         </div>
         <div class="form-group">
-          <label>Note (optional)</label>
-          <input type="text" id="split-note" placeholder="Dinner, cab fare, etc.">
+          <label>Note</label>
+          <input type="text" data-testid="split-note">
         </div>
-        <div class="split-preview-box" id="split-preview">
-          <div style="font-weight:600;margin-bottom:0.5rem;">Live Split Preview</div>
-          <div id="split-shares-preview" style="color:var(--text-muted);font-size:0.9rem;">Enter amount and participants to see preview.</div>
-        </div>
-        <button type="submit" style="width:100%;margin-top:1.5rem;">Create Split Requests</button>
+        <div id="split-preview-container"></div>
+        <button type="submit" data-testid="split-submit" style="width:100%;margin-top:1rem;">Submit Split</button>
       </form>
     </div>
   `;
-
-  const amtInput = document.getElementById("split-amount");
-  const handlesInput = document.getElementById("split-handles");
-
-  function updatePreview() {
-    const minor = parseMajorToMinor(amtInput.value);
-    const rawHandles = handlesInput.value.split(",").map(h => h.trim().replace(/^@/, "")).filter(Boolean);
-    const previewDiv = document.getElementById("split-shares-preview");
-    if (!minor || minor <= 0 || rawHandles.length === 0) {
-      previewDiv.textContent = "Enter amount and participants to see preview.";
-      return;
-    }
-    const n = rawHandles.length;
-    const base = Math.floor(minor / n);
-    const remainder = minor - (base * n);
-    previewDiv.innerHTML = rawHandles.map((h, i) => {
-      const share = base + (i < remainder ? 1 : 0);
-      return `<div style="display:flex;justify-content:space-between;padding:0.25rem 0;"><span>@${h}</span><strong>${formatMinor(share)}</strong></div>`;
-    }).join("");
-  }
-
-  amtInput.oninput = updatePreview;
-  handlesInput.oninput = updatePreview;
-
-  document.getElementById("split-form").onsubmit = async e => {
-    e.preventDefault();
-    const minor = parseMajorToMinor(amtInput.value);
-    const handles = handlesInput.value.split(",").map(h => h.trim().replace(/^@/, "")).filter(Boolean);
-    const note = document.getElementById("split-note").value.trim();
-    const errBox = document.getElementById("split-error");
-    errBox.style.display = "none";
-
-    if (!minor || minor <= 0) {
-      errBox.textContent = "Please enter a valid amount.";
-      errBox.style.display = "block";
-      return;
-    }
-
-    const key = crypto.randomUUID();
-    const res = await apiCall("POST", "/splits", {
-      amount: minor,
-      participant_handles: handles,
-      note: note || undefined
-    }, { "Idempotency-Key": key });
-
-    if (res.ok) {
-      navigateTo("/requests");
-    } else {
-      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Split creation failed";
-      errBox.style.display = "block";
-    }
-  };
 }
 
-async function renderAuthorizations() {
-  const root = document.getElementById("app-root");
+function updateSplitPreview() {
+  const amtStr = document.querySelector('[data-testid="split-amount"]')?.value || "";
+  const handlesStr = document.querySelector('[data-testid="split-handles"]')?.value || "";
+  const container = document.getElementById("split-preview-container");
+  if (!container) return;
+
+  const handles = handlesStr.split(',').map(s => s.trim()).filter(Boolean);
+  const minor = parseDecimalToMinor(amtStr, currentMinorUnits);
+
+  if (minor === null || handles.length === 0) {
+    container.innerHTML = "";
+    return;
+  }
+
+  const n = handles.length;
+  const base = Math.floor(minor / n);
+  const rem = minor - base * n;
+
+  let html = `<div class="split-preview-box" data-testid="split-preview">
+    <div style="font-weight:600;font-size:0.85rem;margin-bottom:0.5rem;color:var(--text-muted);">Split Preview</div>`;
+  for (let i = 0; i < n; i++) {
+    const share = base + (i < rem ? 1 : 0);
+    html += `
+      <div style="display:flex;justify-content:space-between;padding:0.25rem 0;">
+        <span>@${handles[i]}</span>
+        <strong data-testid="split-share-${handles[i]}">${formatMoney(share, currentMinorUnits, currentCurrency)}</strong>
+      </div>
+    `;
+  }
+  html += `</div>`;
+  container.innerHTML = html;
+}
+
+async function handleSplitSubmit(e) {
+  e.preventDefault();
+  const feedback = document.getElementById("split-feedback");
+  const amtStr = document.querySelector('[data-testid="split-amount"]').value;
+  const handlesStr = document.querySelector('[data-testid="split-handles"]').value;
+  const note = document.querySelector('[data-testid="split-note"]').value;
+
+  const minor = parseDecimalToMinor(amtStr, currentMinorUnits);
+  if (minor === null) {
+    feedback.innerHTML = `<div class="error-box" data-testid="split-error">Invalid amount</div>`;
+    return;
+  }
+
+  const handles = handlesStr.split(',').map(s => s.trim()).filter(Boolean);
+  if (handles.length === 0) {
+    feedback.innerHTML = `<div class="error-box" data-testid="split-error">Enter at least one handle</div>`;
+    return;
+  }
+
+  try {
+    const res = await apiRequest("/splits", {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: { amount: minor, participant_handles: handles, note }
+    });
+
+    if (res.ok) {
+      feedback.innerHTML = "";
+      navigate("/requests");
+    } else {
+      const err = await res.json();
+      feedback.innerHTML = `<div class="error-box" data-testid="split-error">${err.error?.code || 'Split refused'}</div>`;
+    }
+  } catch (err) {
+    feedback.innerHTML = `<div class="error-box" data-testid="split-error">Network error</div>`;
+  }
+}
+
+// ----------------------------------------------------------------------------
+// Screen: Authorizations
+// ----------------------------------------------------------------------------
+
+function renderAuthorizations(root) {
   root.innerHTML = `
-    <div class="grid-2">
-      <div class="card">
-        <h3>Authorize a Hold</h3>
-        <div id="auth-error" class="error-box" style="display:none;"></div>
-        <div id="auth-uncertain" class="uncertain-box" style="display:none;">Network failure. Authorization may be pending.</div>
-        <form id="auth-form">
-          <div class="form-group">
-            <label>Recipient Handle</label>
-            <input type="text" id="auth-to-handle" data-testid="authorize-recipient" required placeholder="merchant handle">
+    <div class="card">
+      <h2>Authorizations & Holds</h2>
+      <div id="auth-action-error"></div>
+      
+      <!-- Authorize Form -->
+      <div style="background:#0b1120;border:1px solid var(--border);border-radius:8px;padding:1.25rem;margin-bottom:1.5rem;">
+        <h3>Create Hold</h3>
+        <div id="authorize-feedback"></div>
+        <form onsubmit="handleAuthorizeSubmit(event)">
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Recipient Handle</label>
+              <input type="text" data-testid="authorize-handle" oninput="onAuthorizeFieldChanged()" required>
+            </div>
+            <div class="form-group">
+              <label>Amount (${currentCurrency})</label>
+              <input type="text" data-testid="authorize-amount" placeholder="e.g. 20.00" oninput="onAuthorizeFieldChanged()" required>
+            </div>
           </div>
-          <div class="form-group">
-            <label>Hold Amount (${currentCurrency})</label>
-            <input type="text" id="auth-amount-input" data-testid="authorize-amount" required placeholder="0.00">
+          <div class="grid-2">
+            <div class="form-group">
+              <label>Note</label>
+              <input type="text" data-testid="authorize-note" oninput="onAuthorizeFieldChanged()">
+            </div>
+            <div class="form-group">
+              <label>Visibility</label>
+              <select data-testid="authorize-visibility" onchange="onAuthorizeFieldChanged()">
+                <option value="public" selected>Public</option>
+                <option value="private">Private</option>
+              </select>
+            </div>
           </div>
-          <div class="form-group">
-            <label>Note (optional)</label>
-            <input type="text" id="auth-note-input" data-testid="authorize-note" placeholder="Hotel deposit, etc.">
-          </div>
-          <button type="submit" id="auth-submit-btn" data-testid="authorize-submit" style="width:100%;">Authorize</button>
+          <button type="submit" data-testid="authorize-submit">Authorize Funds</button>
         </form>
       </div>
 
-      <div class="card">
-        <h3>Active Authorizations</h3>
-        <div id="auth-list">Loading...</div>
-      </div>
+      <!-- Authorizations List -->
+      <h3>Active and Past Authorizations</h3>
+      <div id="authorizations-container"></div>
     </div>
   `;
 
-  authorizeFormKey = crypto.randomUUID();
-  authorizeFormSnapshot = null;
+  refreshAuthorizations();
+}
 
-  const toInput = document.getElementById("auth-to-handle");
-  const amtInput = document.getElementById("auth-amount-input");
-  const noteInput = document.getElementById("auth-note-input");
+function getAuthorizeFormSnapshot() {
+  const h = document.querySelector('[data-testid="authorize-handle"]')?.value || "";
+  const a = document.querySelector('[data-testid="authorize-amount"]')?.value || "";
+  const n = document.querySelector('[data-testid="authorize-note"]')?.value || "";
+  const v = document.querySelector('[data-testid="authorize-visibility"]')?.value || "public";
+  return JSON.stringify({h, a, n, v});
+}
 
-  function onAuthChange() {
-    const cur = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
-    if (authorizeFormSnapshot !== null && cur !== authorizeFormSnapshot) {
-      authorizeFormKey = crypto.randomUUID();
-      authorizeFormSnapshot = null;
-    }
+function onAuthorizeFieldChanged() {
+  const snap = getAuthorizeFormSnapshot();
+  if (snap !== authorizeFormSnapshot) {
+    authorizeFormKey = crypto.randomUUID();
+    authorizeFormSnapshot = snap;
   }
-  toInput.oninput = onAuthChange;
-  amtInput.oninput = onAuthChange;
-  noteInput.oninput = onAuthChange;
+}
 
-  document.getElementById("auth-form").onsubmit = async e => {
-    e.preventDefault();
-    const to_handle = toInput.value.trim().replace(/^@/, "");
-    const minor = parseMajorToMinor(amtInput.value);
-    const note = noteInput.value.trim();
-    const errBox = document.getElementById("auth-error");
-    const uncBox = document.getElementById("auth-uncertain");
-    errBox.style.display = "none";
-    uncBox.style.display = "none";
+async function handleAuthorizeSubmit(e) {
+  e.preventDefault();
+  const feedback = document.getElementById("authorize-feedback");
+  const handle = document.querySelector('[data-testid="authorize-handle"]').value.trim();
+  const amountStr = document.querySelector('[data-testid="authorize-amount"]').value.trim();
+  const note = document.querySelector('[data-testid="authorize-note"]').value;
+  const visibility = document.querySelector('[data-testid="authorize-visibility"]').value;
 
-    if (!minor || minor <= 0) {
-      errBox.textContent = "Please enter a valid amount.";
-      errBox.style.display = "block";
+  const minor = parseDecimalToMinor(amountStr, currentMinorUnits);
+  if (minor === null) {
+    feedback.innerHTML = `<div class="error-box" data-testid="authorize-error">Invalid amount</div>`;
+    return;
+  }
+
+  if (!authorizeFormKey) {
+    authorizeFormKey = crypto.randomUUID();
+    authorizeFormSnapshot = getAuthorizeFormSnapshot();
+  }
+
+  try {
+    const res = await apiRequest("/authorizations", {
+      method: "POST",
+      headers: { "Idempotency-Key": authorizeFormKey },
+      body: { to_handle: handle, amount: minor, note, visibility }
+    });
+
+    if (res.ok) {
+      feedback.innerHTML = "";
+      await refreshAuthorizations();
+    } else {
+      const err = await res.json();
+      feedback.innerHTML = `<div class="error-box" data-testid="authorize-error">${err.error?.code || 'Authorization refused'}</div>`;
+    }
+  } catch (err) {
+    feedback.innerHTML = `<div class="error-box" data-testid="authorize-error">Network error</div>`;
+  }
+}
+
+async function refreshAuthorizations() {
+  const container = document.getElementById("authorizations-container");
+  if (!container) return;
+
+  try {
+    const res = await apiRequest("/authorizations?limit=100");
+    if (!res.ok) return;
+    const data = await res.json();
+    const auths = data.authorizations || [];
+
+    if (auths.length === 0) {
+      container.innerHTML = `<div class="empty-state" data-testid="empty-authorizations">No authorizations yet</div>`;
       return;
     }
 
-    authorizeFormSnapshot = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
-    const submitBtn = document.getElementById("auth-submit-btn");
-    submitBtn.disabled = true;
+    let html = `<div data-testid="authorization-list">`;
+    for (const a of auths) {
+      const isPayer = (a.from_user_id === currentUser.user_id);
+      const isReceiver = (a.to_user_id === currentUser.user_id);
+      const remaining = (a.status === 'open') ? (a.amount - (a.captured_amount || 0)) : 0;
+      const remainingDecimal = currentMinorUnits > 0 ? (remaining / Math.pow(10, currentMinorUnits)).toFixed(currentMinorUnits) : String(remaining);
 
-    const res = await apiCall("POST", "/authorizations", {
-      to_handle,
-      amount: minor,
-      note: note || undefined
-    }, { "Idempotency-Key": authorizeFormKey });
-
-    submitBtn.disabled = false;
-
-    if (res.ok) {
-      authorizeFormKey = crypto.randomUUID();
-      authorizeFormSnapshot = null;
-      toInput.value = "";
-      amtInput.value = "";
-      noteInput.value = "";
-      renderAuthorizations();
-    } else if (res.status === 0) {
-      uncBox.style.display = "block";
-    } else {
-      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Authorization failed";
-      errBox.style.display = "block";
-    }
-  };
-
-  await loadAuthorizations();
-}
-
-async function loadAuthorizations() {
-  const container = document.getElementById("auth-list");
-  if (!container) return;
-  const res = await apiCall("GET", "/authorizations");
-  if (!res.ok || !res.data || !res.data.authorizations) {
-    container.innerHTML = `<div class="empty-state">Unable to load authorizations.</div>`;
-    return;
-  }
-  const auths = res.data.authorizations;
-  if (auths.length === 0) {
-    container.innerHTML = `<div class="empty-state">No authorizations yet.</div>`;
-    return;
-  }
-  container.innerHTML = auths.map(a => {
-    const isPayer = (a.from_user_id === currentUser.user_id);
-    const counterparty = isPayer ? `@${a.to_handle}` : `@${a.from_handle}`;
-    let actionButtons = "";
-    if (a.status === "open") {
-      if (isPayer) {
-        actionButtons = `<button class="btn-sm btn-danger" onclick="voidAuth('${a.authorization_id}')">Void</button>`;
-      } else {
-        actionButtons = `<button class="btn-sm" onclick="captureAuth('${a.authorization_id}', ${a.remaining_amount})">Capture Full</button>`;
-      }
-    }
-    return `
-      <div class="list-item" style="flex-direction:column;align-items:stretch;gap:0.5rem;">
-        <div style="display:flex;justify-content:space-between;align-items:center;">
+      html += `
+        <div class="list-item" data-testid="authorization-item-${a.authorization_id}" data-status="${a.status}">
           <div>
-            <strong>${counterparty}</strong> — ${formatMinor(a.amount)}
-            <div style="font-size:0.8rem;color:var(--text-muted);">Remaining: ${formatMinor(a.remaining_amount)}</div>
+            <div style="font-weight:600;">
+              ${isPayer ? `To <strong>@${a.to_handle}</strong>` : `From <strong>@${a.from_handle}</strong>`}
+            </div>
+            <div>
+              Authorized: <span style="font-weight:700;" data-testid="authorization-amount-${a.authorization_id}">${formatMoney(a.amount, currentMinorUnits, currentCurrency)}</span>
+              ${a.status === 'captured' ? ` | Captured: <span data-testid="authorization-captured-${a.authorization_id}">${formatMoney(a.captured_amount, currentMinorUnits, currentCurrency)}</span>` : ''}
+            </div>
+            <div style="font-size:0.85rem;color:var(--text-muted);">Expires: <span data-testid="authorization-expires-${a.authorization_id}">${a.expires_at}</span></div>
           </div>
-          <span class="badge badge-${a.status}">${a.status}</span>
+          <div style="display:flex;gap:0.5rem;align-items:center;">
+            <span class="badge badge-${a.status}">${a.status}</span>
+            ${isReceiver && a.status === 'open' ? `
+              <div style="display:flex;gap:0.35rem;align-items:center;">
+                <input type="text" data-testid="authorization-capture-amount-${a.authorization_id}" value="${remainingDecimal}" style="width:80px;padding:0.25rem 0.5rem;font-size:0.85rem;">
+                <button class="btn-sm" data-testid="authorization-capture-${a.authorization_id}" onclick="actCapture('${a.authorization_id}')">Capture</button>
+              </div>
+            ` : ''}
+            ${isPayer && a.status === 'open' ? `
+              <button class="btn-sm btn-secondary" data-testid="authorization-void-${a.authorization_id}" onclick="actVoid('${a.authorization_id}')">Void</button>
+            ` : ''}
+          </div>
         </div>
-        ${actionButtons ? `<div style="margin-top:0.25rem;">${actionButtons}</div>` : ""}
-      </div>
-    `;
-  }).join("");
+      `;
+    }
+    html += `</div>`;
+    container.innerHTML = html;
+  } catch (err) {}
 }
 
-window.voidAuth = async function(authId) {
-  const res = await apiCall("POST", `/authorizations/${authId}/void`);
-  if (res.ok) renderAuthorizations();
-  else alert((res.data && res.data.error && res.data.error.code) || "Failed to void authorization");
-};
+async function actCapture(id) {
+  const errBox = document.getElementById("auth-action-error");
+  errBox.innerHTML = "";
+  const inputEl = document.querySelector(`[data-testid="authorization-capture-amount-${id}"]`);
+  const amtStr = inputEl?.value.trim() || "";
+  const minor = parseDecimalToMinor(amtStr, currentMinorUnits);
+  if (minor === null) {
+    errBox.innerHTML = `<div class="error-box" data-testid="authorization-error">Invalid capture amount</div>`;
+    return;
+  }
 
-window.captureAuth = async function(authId, remaining) {
-  const key = crypto.randomUUID();
-  const res = await apiCall("POST", `/authorizations/${authId}/capture`, {
-    amount: remaining,
-    final: true
-  }, { "Idempotency-Key": key });
-  if (res.ok) renderAuthorizations();
-  else alert((res.data && res.data.error && res.data.error.code) || "Failed to capture authorization");
-};
+  try {
+    const res = await apiRequest(`/authorizations/${id}/capture`, {
+      method: "POST",
+      headers: { "Idempotency-Key": crypto.randomUUID() },
+      body: { amount: minor }
+    });
+    if (res.ok) {
+      await refreshAuthorizations();
+    } else {
+      const err = await res.json();
+      errBox.innerHTML = `<div class="error-box" data-testid="authorization-error">${err.error?.code || 'Capture refused'}</div>`;
+      await refreshAuthorizations();
+    }
+  } catch (err) {
+    errBox.innerHTML = `<div class="error-box" data-testid="authorization-error">Network error</div>`;
+  }
+}
 
-async function renderStatement() {
-  const root = document.getElementById("app-root");
+async function actVoid(id) {
+  const errBox = document.getElementById("auth-action-error");
+  errBox.innerHTML = "";
+  try {
+    const res = await apiRequest(`/authorizations/${id}/void`, { method: "POST" });
+    if (res.ok) {
+      await refreshAuthorizations();
+    } else {
+      const err = await res.json();
+      errBox.innerHTML = `<div class="error-box" data-testid="authorization-error">${err.error?.code || 'Void refused'}</div>`;
+      await refreshAuthorizations();
+    }
+  } catch (err) {
+    errBox.innerHTML = `<div class="error-box" data-testid="authorization-error">Network error</div>`;
+  }
+}
+
+
+async function renderStatement(root) {
   root.innerHTML = `
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
         <h2>Account Statement</h2>
-        <button class="btn-sm btn-secondary" onclick="renderStatement()">Refresh</button>
+        <button class="btn-sm btn-secondary" onclick="renderStatement(document.getElementById('app-root'))">Refresh</button>
       </div>
       <div id="statement-content">Loading statement...</div>
     </div>
   `;
 
   const container = document.getElementById("statement-content");
-  const res = await apiCall("GET", "/statement");
-  if (!res.ok || !res.data) {
-    container.innerHTML = `<div class="empty-state">Unable to load statement.</div>`;
-    return;
-  }
-
-  const s = res.data;
-  let rows = s.entries.map(e => {
-    const isPositive = e.delta >= 0;
-    const deltaColor = isPositive ? "var(--success)" : "var(--text)";
-    const sign = isPositive ? "+" : "";
-    return `
-      <tr>
-        <td>${e.effective_at.slice(0, 19).replace("T", " ")}</td>
-        <td>${e.payment.from_handle === currentUser.handle ? '@' + e.payment.to_handle : '@' + e.payment.from_handle}</td>
-        <td>${e.payment.note || "-"}</td>
-        <td>rev ${e.revision}</td>
-        <td style="color:${deltaColor};font-weight:600;">${sign}${formatMinor(e.delta)}</td>
-        <td style="font-weight:700;">${formatMinor(e.balance_after)}</td>
-      </tr>
-    `;
-  }).join("");
-
-  if (s.entries.length === 0) {
-    rows = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:2rem;">No entries in statement window.</td></tr>`;
-  }
-
-  container.innerHTML = `
-    <div style="display:flex;gap:2rem;margin-bottom:1.5rem;background:#0b1120;padding:1rem;border-radius:8px;">
-      <div>Opening Balance: <strong>${formatMinor(s.opening_balance)}</strong></div>
-      <div>Closing Balance: <strong>${formatMinor(s.closing_balance)}</strong></div>
-    </div>
-    <table class="statement-table">
-      <thead>
-        <tr>
-          <th>Effective Date</th>
-          <th>Counterparty</th>
-          <th>Memo</th>
-          <th>Revision</th>
-          <th>Delta</th>
-          <th>Balance After</th>
+  try {
+    const res = await apiRequest("/statement");
+    if (!res.ok) {
+      container.innerHTML = `<div class="empty-state">Unable to load statement.</div>`;
+      return;
+    }
+    const s = await res.json();
+    let rows = (s.entries || []).map(e => {
+      const isPositive = e.delta >= 0;
+      const deltaColor = isPositive ? "var(--success)" : "var(--text)";
+      const sign = isPositive ? "+" : "";
+      const otherHandle = (e.payment && e.payment.from_handle === currentUser?.handle) ? ('@' + e.payment.to_handle) : ('@' + (e.payment?.from_handle || ''));
+      return `
+        <tr style="border-bottom:1px solid var(--border);">
+          <td style="padding:0.75rem;">${(e.effective_at || '').slice(0, 19).replace("T", " ")}</td>
+          <td style="padding:0.75rem;">${otherHandle}</td>
+          <td style="padding:0.75rem;">${e.payment?.note || "-"}</td>
+          <td style="padding:0.75rem;">rev ${e.revision}</td>
+          <td style="padding:0.75rem;color:${deltaColor};font-weight:600;">${sign}${formatMoney(e.delta, currentMinorUnits, currentCurrency)}</td>
+          <td style="padding:0.75rem;font-weight:700;">${formatMoney(e.balance_after, currentMinorUnits, currentCurrency)}</td>
         </tr>
-      </thead>
-      <tbody>
-        ${rows}
-      </tbody>
-    </table>
-  `;
+      `;
+    }).join("");
+
+    if (!s.entries || s.entries.length === 0) {
+      rows = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:2rem;">No entries in statement window.</td></tr>`;
+    }
+
+    container.innerHTML = `
+      <div style="display:flex;gap:2rem;margin-bottom:1.5rem;background:#0b1120;padding:1rem;border-radius:8px;">
+        <div>Opening Balance: <strong>${formatMoney(s.opening_balance, currentMinorUnits, currentCurrency)}</strong></div>
+        <div>Closing Balance: <strong>${formatMoney(s.closing_balance, currentMinorUnits, currentCurrency)}</strong></div>
+      </div>
+      <table style="width:100%;border-collapse:collapse;margin-top:1rem;">
+        <thead>
+          <tr style="border-bottom:1px solid var(--border);text-align:left;color:var(--text-muted);">
+            <th style="padding:0.75rem;">Effective Date</th>
+            <th style="padding:0.75rem;">Counterparty</th>
+            <th style="padding:0.75rem;">Memo</th>
+            <th style="padding:0.75rem;">Revision</th>
+            <th style="padding:0.75rem;">Delta</th>
+            <th style="padding:0.75rem;">Balance After</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${rows}
+        </tbody>
+      </table>
+    `;
+  } catch (err) {
+    container.innerHTML = `<div class="empty-state">Unable to load statement.</div>`;
+  }
 }
 
-window.onload = init;
+// Initial bootstrap
+route();
 </script>
 </body>
 </html>
@@ -1726,8 +1958,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(422, "validation_failed")
 
         with STATE_LOCK:
-            if email.lower() in STATE["by_email"] or derived_handle in STATE["by_handle"]:
-                return self.fail(409, "user_already_exists")
+            if email.lower() in STATE["by_email"]:
+                return self.fail(409, "email_taken")
+
+            if derived_handle in STATE["by_handle"]:
+                return self.fail(409, "handle_taken")
 
             user_id = f"u_{derived_handle}_{uuid.uuid4().hex[:4]}"
             user = {
@@ -2791,7 +3026,10 @@ class Handler(BaseHTTPRequestHandler):
             if user["id"] != req["payer_id"]:
                 return self.fail(403, "forbidden")
 
-            if req["status"] != "pending":
+            if req["status"] == "declined":
+                return self.send_json(200, req)
+
+            if req["status"] in ("paid", "cancelled"):
                 return self.fail(409, "request_not_pending")
 
             req["status"] = "declined"
@@ -2806,7 +3044,10 @@ class Handler(BaseHTTPRequestHandler):
             if user["id"] != req["requester_id"]:
                 return self.fail(403, "forbidden")
 
-            if req["status"] != "pending":
+            if req["status"] == "cancelled":
+                return self.send_json(200, req)
+
+            if req["status"] in ("paid", "declined"):
                 return self.fail(409, "request_not_pending")
 
             req["status"] = "cancelled"
@@ -2924,6 +3165,7 @@ class Handler(BaseHTTPRequestHandler):
         settlement_id = new_settlement_id()
         created_at = monotonic_now_iso()
         payment_ids = []
+        payments_out = []
 
         for t in transfers:
             amt = int(t["amount"])
@@ -2963,11 +3205,14 @@ class Handler(BaseHTTPRequestHandler):
             }
             STATE["payments"].append(pm)
             payment_ids.append(pid)
+            payments_out.append(payment_to_dict(pm))
 
         return 201, {
             "settlement_id": settlement_id,
             "transfers_count": len(transfers),
             "payment_ids": payment_ids,
+            "payments": payments_out,
+            "committed_at": created_at,
             "created_at": created_at
         }
 

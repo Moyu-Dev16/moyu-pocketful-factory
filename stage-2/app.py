@@ -108,7 +108,7 @@ def get_user_balances(user_id: str, now_str: str | None = None) -> tuple[int, in
 # Web UI HTML Template (Self-contained SPA)
 # =============================================================================
 
-INDEX_HTML = """<!DOCTYPE html>
+INDEX_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -489,12 +489,17 @@ async function handleSignupSubmit(e) {
 // ----------------------------------------------------------------------------
 
 function renderWallet(root) {
+  const initTot = currentUser ? (currentUser.balance ?? currentUser.total ?? 0) : 0;
+  const initAvail = currentUser ? (currentUser.available ?? initTot) : 0;
+  const initBalStr = formatMoney(initTot, currentMinorUnits, currentCurrency);
+  const initAvailStr = formatMoney(initAvail, currentMinorUnits, currentCurrency);
+
   root.innerHTML = `
     <div class="card balance-card">
       <div class="balance-label">Available to Spend</div>
-      <div class="balance-headline" data-testid="wallet-available" data-amount="0">0.00 EUR</div>
+      <div class="balance-headline" data-testid="wallet-available" data-amount="${initAvail}">${initAvailStr}</div>
       <div class="balance-secondary">
-        <div>Total: <span data-testid="wallet-balance" data-amount="0">0.00 EUR</span></div>
+        <div>Total: <span data-testid="wallet-balance" data-amount="${initTot}">${initBalStr}</span></div>
         <div id="wallet-held-container"></div>
       </div>
       <div style="margin-top:1.25rem;">
@@ -581,13 +586,11 @@ function onPayFieldChanged() {
 }
 
 async function refreshWallet() {
-  const seq = ++latestRefreshSeq;
   try {
     const [meRes, actRes] = await Promise.all([
       apiRequest("/me"),
       apiRequest("/activity?limit=100")
     ]);
-    if (seq !== latestRefreshSeq) return; // Out-of-order drop
 
     if (meRes.ok) {
       const me = await meRes.json();
@@ -679,6 +682,21 @@ async function handlePaySubmit(e) {
 
     if (res.ok) {
       feedback.innerHTML = "";
+      if (currentUser) {
+        currentUser.balance = (currentUser.balance || 0) - minor;
+        currentUser.total = (currentUser.total || 0) - minor;
+        currentUser.available = (currentUser.available || 0) - minor;
+        const elAvail = document.querySelector('[data-testid="wallet-available"]');
+        const elBal = document.querySelector('[data-testid="wallet-balance"]');
+        if (elAvail) {
+          elAvail.textContent = formatMoney(currentUser.available, currentMinorUnits, currentCurrency);
+          elAvail.setAttribute("data-amount", String(currentUser.available));
+        }
+        if (elBal) {
+          elBal.textContent = formatMoney(currentUser.total, currentMinorUnits, currentCurrency);
+          elBal.setAttribute("data-amount", String(currentUser.total));
+        }
+      }
       await refreshWallet();
     } else {
       const err = await res.json();
@@ -1615,8 +1633,11 @@ class Handler(BaseHTTPRequestHandler):
             return self.fail(422, "validation_failed")
 
         with STATE_LOCK:
-            if email.lower() in STATE["by_email"] or derived_handle in STATE["by_handle"]:
-                return self.fail(409, "user_already_exists")
+            if email.lower() in STATE["by_email"]:
+                return self.fail(409, "email_taken")
+
+            if derived_handle in STATE["by_handle"]:
+                return self.fail(409, "handle_taken")
 
             user_id = f"u_{derived_handle}_{uuid.uuid4().hex[:4]}"
             user = {
@@ -2077,7 +2098,10 @@ class Handler(BaseHTTPRequestHandler):
             if user["id"] != req["payer_id"]:
                 return self.fail(403, "forbidden")
 
-            if req["status"] != "pending":
+            if req["status"] == "declined":
+                return self.send_json(200, req)
+
+            if req["status"] in ("paid", "cancelled"):
                 return self.fail(409, "request_not_pending")
 
             req["status"] = "declined"
@@ -2092,7 +2116,10 @@ class Handler(BaseHTTPRequestHandler):
             if user["id"] != req["requester_id"]:
                 return self.fail(403, "forbidden")
 
-            if req["status"] != "pending":
+            if req["status"] == "cancelled":
+                return self.send_json(200, req)
+
+            if req["status"] in ("paid", "declined"):
                 return self.fail(409, "request_not_pending")
 
             req["status"] = "cancelled"
@@ -2210,6 +2237,7 @@ class Handler(BaseHTTPRequestHandler):
         settlement_id = f"s_{uuid.uuid4().hex[:8]}"
         created_at = now_iso()
         payment_ids = []
+        payments_out = []
 
         for t in transfers:
             amt = int(t["amount"])
@@ -2239,11 +2267,14 @@ class Handler(BaseHTTPRequestHandler):
             }
             STATE["payments"].append(pm)
             payment_ids.append(pid)
+            payments_out.append(pm)
 
         return 201, {
             "settlement_id": settlement_id,
             "transfers_count": len(transfers),
             "payment_ids": payment_ids,
+            "payments": payments_out,
+            "committed_at": created_at,
             "created_at": created_at
         }
 
