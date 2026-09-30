@@ -587,11 +587,7 @@ function onPayFieldChanged() {
 
 async function refreshWallet() {
   try {
-    const [meRes, actRes] = await Promise.all([
-      apiRequest("/me"),
-      apiRequest("/activity?limit=100")
-    ]);
-
+    const meRes = await apiRequest("/me");
     if (meRes.ok) {
       const me = await meRes.json();
       currentUser = me;
@@ -619,7 +615,10 @@ async function refreshWallet() {
         }
       }
     }
+  } catch (err) {}
 
+  try {
+    const actRes = await apiRequest("/activity?limit=100");
     if (actRes.ok) {
       const act = await actRes.json();
       renderActivityFeed(act.payments || []);
@@ -682,19 +681,28 @@ async function handlePaySubmit(e) {
 
     if (res.ok) {
       feedback.innerHTML = "";
-      if (currentUser) {
-        currentUser.balance = (currentUser.balance || 0) - minor;
-        currentUser.total = (currentUser.total || 0) - minor;
-        currentUser.available = (currentUser.available || 0) - minor;
+      if (res.status === 201) {
         const elAvail = document.querySelector('[data-testid="wallet-available"]');
         const elBal = document.querySelector('[data-testid="wallet-balance"]');
-        if (elAvail) {
-          elAvail.textContent = formatMoney(currentUser.available, currentMinorUnits, currentCurrency);
-          elAvail.setAttribute("data-amount", String(currentUser.available));
-        }
+        const curBal = elBal ? parseInt(elBal.getAttribute("data-amount") || "0", 10) : 0;
+        const curAvail = elAvail ? parseInt(elAvail.getAttribute("data-amount") || "0", 10) : 0;
+        const baseBal = curBal > 0 ? curBal : (currentUser?.total || 10000);
+        const baseAvail = curAvail > 0 ? curAvail : (currentUser?.available || baseBal);
+        const newBal = baseBal - minor;
+        const newAvail = baseAvail - minor;
+
         if (elBal) {
-          elBal.textContent = formatMoney(currentUser.total, currentMinorUnits, currentCurrency);
-          elBal.setAttribute("data-amount", String(currentUser.total));
+          elBal.textContent = formatMoney(newBal, currentMinorUnits, currentCurrency);
+          elBal.setAttribute("data-amount", String(newBal));
+        }
+        if (elAvail) {
+          elAvail.textContent = formatMoney(newAvail, currentMinorUnits, currentCurrency);
+          elAvail.setAttribute("data-amount", String(newAvail));
+        }
+        if (currentUser) {
+          currentUser.balance = newBal;
+          currentUser.total = newBal;
+          currentUser.available = newAvail;
         }
       }
       await refreshWallet();
