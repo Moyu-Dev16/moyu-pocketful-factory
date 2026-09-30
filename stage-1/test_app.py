@@ -217,6 +217,40 @@ class WalletContractTests(unittest.TestCase):
         self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
         self.assertEqual(before, self.export_document())
 
+    def test_import_rejects_split_effective_time_without_state_change(self):
+        _, payment = self.pay(10, "time-pair-payment")
+        before = self.export_document()
+        malformed = json.loads(json.dumps(before))
+        for entry in malformed["state"]["ledger"]:
+            if entry["payment_id"] == payment["payment_id"] and entry["side"] == "credit":
+                entry["effective_at"] = "2099-01-01T00:00:00+00:00"
+        self.assertEqual(422, self.request("POST", "/_test/import", malformed)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_import_rejects_cross_payment_entry_binding_without_state_change(self):
+        _, first = self.pay(10, "first-binding-payment")
+        _, second = self.pay(5, "second-binding-payment")
+        before = self.export_document()
+        malformed = json.loads(json.dumps(before))
+        for entry in malformed["state"]["ledger"]:
+            if entry["payment_id"] == first["payment_id"] and entry["side"] == "credit":
+                entry["payment_id"] = second["payment_id"]
+        self.assertEqual(422, self.request("POST", "/_test/import", malformed)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_corrected_payment_export_import_round_trip(self):
+        effective = "2026-09-01T12:00:00+00:00"
+        _, payment = self.pay(30, "correction-round-trip", effective_at=effective)
+        status, _ = self.request(
+            "POST", f"/payments/{payment['payment_id']}/corrections",
+            {"expected_revision": 1, "amount": 20, "effective_at": effective, "reason": "回灌校验"},
+            self.alice, "correction-round-trip-key"
+        )
+        self.assertEqual(201, status)
+        before = self.export_document()
+        self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
+        self.assertEqual(before, self.export_document())
+
 
 if __name__ == "__main__":
     unittest.main()

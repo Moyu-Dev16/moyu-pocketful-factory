@@ -201,6 +201,7 @@ def validate_candidate_state(candidate: dict) -> None:
     if any(uid not in users for uid in candidate["settlement_operator_ids"]):
         raise ValueError("invalid_settlement_operator")
 
+    payments_by_id = {}
     payment_ids = set()
     for payment in candidate["payments"]:
         if not isinstance(payment, dict):
@@ -209,6 +210,7 @@ def validate_candidate_state(candidate: dict) -> None:
         if not isinstance(payment_id, str) or payment_id in payment_ids:
             raise ValueError("invalid_payment")
         payment_ids.add(payment_id)
+        payments_by_id[payment_id] = payment
         if (payment.get("from_user_id") not in users or payment.get("to_user_id") not in users
                 or payment.get("from_user_id") == payment.get("to_user_id")):
             raise ValueError("invalid_payment_account")
@@ -234,6 +236,10 @@ def validate_candidate_state(candidate: dict) -> None:
                     or parse_rfc3339(revision.get("effective_at")) is None
                     or parse_rfc3339(revision.get("recorded_at")) is None):
                 raise ValueError("invalid_revision")
+        if (revisions[0]["amount"] != payment["amount"]
+                or revisions[0]["effective_at"] != payment["effective_at"]
+                or revisions[0]["recorded_at"] != payment["recorded_at"]):
+            raise ValueError("payment_revision_mismatch")
 
     request_ids = set()
     for request in candidate["requests"]:
@@ -280,13 +286,79 @@ def validate_candidate_state(candidate: dict) -> None:
             raise ValueError("invalid_ledger_entry")
         entry_ids.add(entry_id)
         transactions.setdefault(transaction_id, []).append(entry)
+    transaction_pairs_by_payment = {}
+    allowed_kinds = {"payment", "fixture", "request_payment", "settlement", "correction"}
     for entries in transactions.values():
         if (len(entries) != 2 or {entry["side"] for entry in entries} != {"debit", "credit"}
                 or len({entry["account_id"] for entry in entries}) != 2
                 or len({entry["amount"] for entry in entries}) != 1
                 or len({entry["currency"] for entry in entries}) != 1
+                or len({entry["payment_id"] for entry in entries}) != 1
+                or len({entry["effective_at"] for entry in entries}) != 1
+                or len({entry["recorded_at"] for entry in entries}) != 1
+                or len({entry.get("kind") for entry in entries}) != 1
+                or entries[0].get("kind") not in allowed_kinds
                 or sum(entry["delta"] for entry in entries) != 0):
             raise ValueError("unbalanced_transaction")
+
+        debit = next(entry for entry in entries if entry["side"] == "debit")
+        credit = next(entry for entry in entries if entry["side"] == "credit")
+        payment = payments_by_id[debit["payment_id"]]
+        kind = debit["kind"]
+        revisions = payment["revisions"]
+
+        if kind == "correction":
+            matches = []
+            for index, revision in enumerate(revisions[1:], 1):
+                delta = revision["amount"] - revisions[index - 1]["amount"]
+                if revision.get("delta") != delta:
+                    raise ValueError("invalid_revision_delta")
+                if (delta != 0 and abs(delta) == debit["amount"]
+                        and revision["effective_at"] == debit["effective_at"]
+                        and revision["recorded_at"] == debit["recorded_at"]):
+                    expected_debit = payment["from_user_id"] if delta > 0 else payment["to_user_id"]
+                    expected_credit = payment["to_user_id"] if delta > 0 else payment["from_user_id"]
+                    if debit["account_id"] == expected_debit and credit["account_id"] == expected_credit:
+                        matches.append(index + 1)
+            if len(matches) != 1 or payment.get("request_id") or payment.get("settlement_id"):
+                raise ValueError("invalid_correction_entries")
+            revision_number = matches[0]
+        else:
+            first_revision = revisions[0]
+            if (debit["account_id"] != payment["from_user_id"]
+                    or credit["account_id"] != payment["to_user_id"]
+                    or debit["amount"] != first_revision["amount"]
+                    or debit["effective_at"] != first_revision["effective_at"]
+                    or debit["recorded_at"] != first_revision["recorded_at"]):
+                raise ValueError("payment_ledger_mismatch")
+            if ((kind == "request_payment") != (payment.get("request_id") is not None)
+                    or (kind == "settlement") != (payment.get("settlement_id") is not None)):
+                if kind != "fixture":
+                    raise ValueError("payment_kind_mismatch")
+            revision_number = 1
+
+        transaction_pairs_by_payment.setdefault(debit["payment_id"], []).append({
+            "kind": kind, "revision": revision_number
+        })
+
+    # 每个 payment 必须恰好有一个初始双录对，每个非零更正也必须恰好有一个差额双录对。
+    for payment_id, payment in payments_by_id.items():
+        pairs = transaction_pairs_by_payment.get(payment_id, [])
+        if len([pair for pair in pairs if pair["revision"] == 1]) != 1:
+            raise ValueError("missing_payment_entries")
+        expected_corrections = []
+        revisions = payment["revisions"]
+        for index, revision in enumerate(revisions[1:], 1):
+            delta = revision["amount"] - revisions[index - 1]["amount"]
+            if revision.get("delta") != delta:
+                raise ValueError("invalid_revision_delta")
+            if delta:
+                expected_corrections.append(index + 1)
+        actual_corrections = sorted(
+            pair["revision"] for pair in pairs if pair["kind"] == "correction"
+        )
+        if actual_corrections != expected_corrections:
+            raise ValueError("missing_correction_entries")
 
     if sum(user["opening_balance"] for user in users.values()) != candidate["initial_total"]:
         raise ValueError("opening_total_mismatch")
