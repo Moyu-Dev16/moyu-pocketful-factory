@@ -276,7 +276,7 @@ function formatMoney(minor, minorUnits, currency) {
 function parseDecimalToMinor(valStr, minorUnits) {
   if (typeof valStr !== 'string') return null;
   valStr = valStr.trim();
-  if (!/^[0-9]+(\\.[0-9]+)?$/.test(valStr)) return null;
+  if (!/^[0-9]+(\.[0-9]+)?$/.test(valStr)) return null;
   const parts = valStr.split('.');
   const intPart = parseInt(parts[0], 10);
   const fracStr = parts[1] || '';
@@ -1453,13 +1453,15 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["payments"].append(pm)
 
             for r in fixture.get("requests", []):
-                req_u = STATE["users"].get(r["requester_user_id"])
-                pay_u = STATE["users"].get(r["payer_user_id"])
+                requester_id = r.get("requester_user_id") or r.get("requester_id")
+                payer_id = r.get("payer_user_id") or r.get("payer_id")
+                req_u = STATE["users"].get(requester_id)
+                pay_u = STATE["users"].get(payer_id)
                 rq = {
                     "request_id": r.get("id") or f"rq_{uuid.uuid4().hex[:8]}",
-                    "requester_id": r["requester_user_id"],
+                    "requester_id": requester_id,
                     "requester_handle": req_u["handle"] if req_u else "",
-                    "payer_id": r["payer_user_id"],
+                    "payer_id": payer_id,
                     "payer_handle": pay_u["handle"] if pay_u else "",
                     "amount": int(r["amount"]),
                     "currency": STATE["currency"],
