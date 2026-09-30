@@ -1,0 +1,2936 @@
+"""Pocketful Stage 3 Server — bitemporal P2P payments, statements & payment corrections."""
+from __future__ import annotations
+
+import functools
+import hashlib
+import http.cookies
+import json
+import os
+import re
+import sys
+import threading
+import uuid
+from datetime import datetime, timezone, timedelta
+from http.server import HTTPServer, BaseHTTPRequestHandler
+from socketserver import ThreadingMixIn
+from urllib.parse import urlparse, parse_qs
+
+from passwords import hash_password, verify_password
+
+
+class ThreadingHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+STATE_LOCK = threading.RLock()
+
+STATE = {
+    "currency": "EUR",
+    "minor_units": 2,
+    "authorization_ttl_seconds": 600,
+    "settlement_operator_ids": set(),
+    "reset_time": None,
+    "users": {},            # user_id -> user dict {"id", "email", "password", "display_name", "handle", "balance", "opening_balance"}
+    "by_handle": {},        # handle -> user_id
+    "by_email": {},         # email.lower() -> user_id
+    "tokens": {},           # token -> user_id
+    "payments": [],         # list of payment dicts
+    "requests": [],         # list of request dicts
+    "authorizations": [],   # list of authorization dicts
+    "snapshots": {},        # token -> snapshot dict
+    "idempotency": {},      # (user_id, method, path, key) -> {"canonical_body": ..., "response": ..., "status": ...}
+}
+
+
+LAST_TIMESTAMP = None
+PAYMENT_SEQ = 0
+REQUEST_SEQ = 0
+AUTH_SEQ = 0
+SETTLEMENT_SEQ = 0
+
+
+def monotonic_now_dt() -> datetime:
+    global LAST_TIMESTAMP
+    now_dt = datetime.now(timezone.utc)
+    if LAST_TIMESTAMP is not None and now_dt <= LAST_TIMESTAMP:
+        now_dt = LAST_TIMESTAMP + timedelta(microseconds=10)
+    LAST_TIMESTAMP = now_dt
+    return now_dt
+
+
+def now_iso() -> str:
+    return monotonic_now_dt().isoformat()
+
+
+def monotonic_now_iso() -> str:
+    return monotonic_now_dt().isoformat()
+
+
+def new_payment_id() -> str:
+    global PAYMENT_SEQ
+    PAYMENT_SEQ += 1
+    return f"p_{PAYMENT_SEQ:08d}_{uuid.uuid4().hex[:4]}"
+
+
+def new_request_id() -> str:
+    global REQUEST_SEQ
+    REQUEST_SEQ += 1
+    return f"rq_{REQUEST_SEQ:08d}_{uuid.uuid4().hex[:4]}"
+
+
+def new_auth_id() -> str:
+    global AUTH_SEQ
+    AUTH_SEQ += 1
+    return f"a_{AUTH_SEQ:08d}_{uuid.uuid4().hex[:4]}"
+
+
+def new_settlement_id() -> str:
+    global SETTLEMENT_SEQ
+    SETTLEMENT_SEQ += 1
+    return f"s_{SETTLEMENT_SEQ:08d}_{uuid.uuid4().hex[:4]}"
+
+
+def parse_rfc3339(val: str | None) -> datetime | None:
+    if not isinstance(val, str) or not val.strip():
+        return None
+    val = val.strip()
+    if "T" not in val and "t" not in val:
+        return None
+    try:
+        dt_val = datetime.fromisoformat(val)
+        if dt_val.tzinfo is None or dt_val.utcoffset() is None:
+            return None
+        return dt_val
+    except Exception:
+        return None
+
+
+def is_valid_amount(val) -> bool:
+    if isinstance(val, bool):
+        return False
+    if not isinstance(val, (int, float)):
+        return False
+    if isinstance(val, float) and not val.is_integer():
+        return False
+    ival = int(val)
+    return 1 <= ival <= 1_000_000_000
+
+
+def normalize_json_value(val):
+    if isinstance(val, bool):
+        return val
+    if isinstance(val, float) and val.is_integer():
+        return int(val)
+    if isinstance(val, dict):
+        return {k: normalize_json_value(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [normalize_json_value(v) for v in val]
+    return val
+
+
+def canonical_json(val) -> str:
+    return json.dumps(normalize_json_value(val), sort_keys=True, separators=(',', ':'))
+
+
+def format_money(minor: int, minor_units: int, currency: str) -> str:
+    if minor_units == 0:
+        return f"{minor} {currency}"
+    text = str(minor).rjust(minor_units + 1, "0")
+    return f"{text[:-minor_units]}.{text[-minor_units:]} {currency}"
+
+
+def payment_to_dict(p: dict) -> dict:
+    return {
+        "payment_id": p["payment_id"],
+        "from_user_id": p["from_user_id"],
+        "from_handle": p["from_handle"],
+        "to_user_id": p["to_user_id"],
+        "to_handle": p["to_handle"],
+        "amount": p["amount"],
+        "currency": p["currency"],
+        "note": p.get("note", ""),
+        "visibility": p.get("visibility", "public"),
+        "request_id": p.get("request_id"),
+        "authorization_id": p.get("authorization_id"),
+        "settlement_id": p.get("settlement_id"),
+        "created_at": p["created_at"],
+        "refund_of": p.get("refund_of", None)
+    }
+
+
+def auth_to_dict(a: dict) -> dict:
+    return {
+        "authorization_id": a["authorization_id"],
+        "from_user_id": a["from_user_id"],
+        "from_handle": a["from_handle"],
+        "to_user_id": a["to_user_id"],
+        "to_handle": a["to_handle"],
+        "amount": a["amount"],
+        "captured_amount": a.get("captured_amount", 0),
+        "remaining_amount": a.get("remaining_amount", 0),
+        "currency": a["currency"],
+        "note": a.get("note", ""),
+        "visibility": a.get("visibility", "public"),
+        "status": a["status"],
+        "expires_at": a["expires_at"],
+        "closed_at": a.get("closed_at"),
+        "payment_id": a.get("payment_id"),
+        "payment_ids": a.get("payment_ids", []),
+        "created_at": a["created_at"]
+    }
+
+
+def check_and_update_authorizations_expiry(now_str: str | None = None) -> None:
+    """Must be called under STATE_LOCK."""
+    if now_str is None:
+        now_str = now_iso()
+    for a in STATE["authorizations"]:
+        if a["status"] == "open" and a["expires_at"] <= now_str:
+            a["status"] = "expired"
+            a["remaining_amount"] = 0
+            a["closed_at"] = a["expires_at"]
+
+
+def compute_auth_hold(a: dict, T: datetime, K: datetime) -> int:
+    created_dt = parse_rfc3339(a["created_at"])
+    if created_dt is None or created_dt > K:
+        return 0
+    if T < created_dt:
+        return 0
+    expires_dt = parse_rfc3339(a["expires_at"])
+    if expires_dt is not None and T >= expires_dt:
+        return 0
+
+    held = a["amount"]
+    events = a.get("events", [])
+    for ev in events:
+        ev_dt = parse_rfc3339(ev["time"])
+        if ev_dt is None or ev_dt > K or ev_dt > T:
+            continue
+        if ev["type"] == "void":
+            return 0
+        elif ev["type"] == "capture":
+            if ev.get("final", True):
+                return 0
+            else:
+                held = max(0, held - ev["amount"])
+    return held
+
+
+def compute_historical_balances(user_id: str, T: datetime, K: datetime,
+                                candidate_payment_id: str | None = None,
+                                candidate_rev: dict | None = None) -> tuple[int, int, int]:
+    """Computes (total, available, held) for user_id as of effective time T and known time K.
+    Optionally includes a candidate revision for candidate_payment_id."""
+    user = STATE["users"].get(user_id)
+    if not user:
+        return 0, 0, 0
+
+    total = user.get("opening_balance", 0)
+
+    for p in STATE["payments"]:
+        if p["from_user_id"] != user_id and p["to_user_id"] != user_id:
+            continue
+
+        revs = list(p.get("revisions", []))
+        if candidate_payment_id and p["payment_id"] == candidate_payment_id and candidate_rev:
+            revs.append(candidate_rev)
+
+        revs_known = [
+            r for r in revs
+            if parse_rfc3339(r["recorded_at"]) is not None and parse_rfc3339(r["recorded_at"]) <= K
+        ]
+        if not revs_known:
+            continue
+        selected_rev = max(revs_known, key=lambda r: r["revision"])
+
+        eff_dt = parse_rfc3339(selected_rev["effective_at"])
+        if eff_dt is not None and eff_dt <= T:
+            amt = selected_rev["amount"]
+            if p["to_user_id"] == user_id:
+                total += amt
+            elif p["from_user_id"] == user_id:
+                total -= amt
+
+    held = 0
+    for a in STATE["authorizations"]:
+        if a["from_user_id"] == user_id:
+            held += compute_auth_hold(a, T, K)
+
+    available = total - held
+    return total, available, held
+
+
+def get_user_balances(user_id: str, now_str: str | None = None) -> tuple[int, int, int]:
+    """Must be called under STATE_LOCK. Returns (total, available, held)."""
+    check_and_update_authorizations_expiry(now_str)
+    user = STATE["users"].get(user_id)
+    if not user:
+        return 0, 0, 0
+    total = user["balance"]
+    held = sum(
+        a.get("remaining_amount", a["amount"] - a.get("captured_amount", 0))
+        for a in STATE["authorizations"]
+        if a["from_user_id"] == user_id and a["status"] == "open"
+    )
+    available = max(0, total - held)
+    return total, available, held
+
+
+# =============================================================================
+# Web UI HTML Template (Self-contained SPA with Statement Support)
+# =============================================================================
+
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pocketful</title>
+<style>
+  :root {
+    --bg: #0f172a;
+    --surface: #1e293b;
+    --surface-hover: #334155;
+    --border: #334155;
+    --text: #f8fafc;
+    --text-muted: #94a3b8;
+    --primary: #38bdf8;
+    --primary-hover: #0ea5e9;
+    --success: #34d399;
+    --danger: #f87171;
+    --warning: #fbbf24;
+    --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    line-height: 1.5;
+    min-height: 100vh;
+    padding-bottom: 3rem;
+  }
+  header {
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    padding: 1rem 1.5rem;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+  }
+  .brand { font-size: 1.25rem; font-weight: 700; color: var(--primary); text-decoration: none; }
+  nav { display: flex; gap: 1rem; align-items: center; }
+  nav a { color: var(--text-muted); text-decoration: none; font-size: 0.95rem; font-weight: 500; }
+  nav a:hover, nav a.active { color: var(--text); }
+  .user-badge { display: flex; align-items: center; gap: 0.75rem; font-size: 0.9rem; }
+  .container { max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  .card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 1.5rem;
+    margin-bottom: 1.5rem;
+  }
+  .balance-card { text-align: center; padding: 2rem; }
+  .balance-label { font-size: 0.875rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.05em; }
+  .balance-headline { font-size: 2.75rem; font-weight: 700; color: var(--text); margin: 0.5rem 0; }
+  .balance-secondary { display: flex; justify-content: center; gap: 2rem; color: var(--text-muted); font-size: 0.95rem; margin-top: 0.5rem; }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; }
+  @media (max-width: 768px) { .grid-2 { grid-template-columns: 1fr; } }
+  h2, h3 { font-size: 1.25rem; font-weight: 600; margin-bottom: 1rem; }
+  .form-group { margin-bottom: 1rem; }
+  label { display: block; font-size: 0.85rem; color: var(--text-muted); margin-bottom: 0.25rem; }
+  input, select, textarea {
+    width: 100%;
+    padding: 0.65rem 0.85rem;
+    background: #0b1120;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.95rem;
+    outline: none;
+  }
+  input:focus, select:focus, textarea:focus { border-color: var(--primary); }
+  button {
+    padding: 0.65rem 1.25rem;
+    background: var(--primary);
+    color: #0b1120;
+    border: none;
+    border-radius: 6px;
+    font-weight: 600;
+    cursor: pointer;
+    font-size: 0.95rem;
+    transition: background 0.15s;
+  }
+  button:hover { background: var(--primary-hover); }
+  .btn-sm { padding: 0.35rem 0.75rem; font-size: 0.85rem; }
+  .btn-danger { background: var(--danger); color: white; }
+  .btn-secondary { background: var(--surface-hover); color: var(--text); }
+  .error-box { background: rgba(248, 113, 113, 0.15); border: 1px solid var(--danger); color: var(--danger); padding: 0.75rem; border-radius: 6px; font-size: 0.9rem; margin-bottom: 1rem; }
+  .uncertain-box { background: rgba(251, 191, 36, 0.15); border: 1px solid var(--warning); color: var(--warning); padding: 0.75rem; border-radius: 6px; font-size: 0.9rem; margin-bottom: 1rem; }
+  .empty-state { text-align: center; padding: 2.5rem; color: var(--text-muted); font-size: 0.95rem; }
+  .list-item {
+    border-bottom: 1px solid var(--border);
+    padding: 1rem 0;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .list-item:last-child { border-bottom: none; }
+  .badge {
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+  }
+  .badge-pending { background: rgba(251, 191, 36, 0.2); color: var(--warning); }
+  .badge-paid, .badge-captured { background: rgba(52, 211, 153, 0.2); color: var(--success); }
+  .badge-declined, .badge-cancelled, .badge-voided { background: rgba(248, 113, 113, 0.2); color: var(--danger); }
+  .badge-expired { background: rgba(148, 163, 184, 0.2); color: var(--text-muted); }
+  .split-preview-box { background: #0b1120; border: 1px solid var(--border); border-radius: 6px; padding: 1rem; margin-top: 1rem; }
+  table.statement-table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+  table.statement-table th, table.statement-table td { padding: 0.75rem; text-align: left; border-bottom: 1px solid var(--border); font-size: 0.9rem; }
+  table.statement-table th { color: var(--text-muted); font-weight: 600; }
+</style>
+</head>
+<body>
+<header>
+  <div style="display:flex;align-items:center;gap:1.5rem;">
+    <a href="/" class="brand">Pocketful</a>
+    <nav id="nav-links">
+      <a href="/" id="nav-wallet">Wallet</a>
+      <a href="/requests" id="nav-requests">Requests</a>
+      <a href="/split" id="nav-split">Split</a>
+      <a href="/authorizations" id="nav-authorizations">Authorizations</a>
+      <a href="/statement" id="nav-statement">Statement</a>
+    </nav>
+  </div>
+  <div id="auth-header"></div>
+</header>
+
+<main class="container" id="app-root"></main>
+
+<script>
+let currentCurrency = "EUR";
+let currentMinorUnits = 2;
+let currentUser = null;
+let currentToken = localStorage.getItem("pocketful_token") || getCookie("token") || "";
+
+let payFormKey = null;
+let payFormSnapshot = null;
+let authorizeFormKey = null;
+let authorizeFormSnapshot = null;
+let latestRefreshSeq = 0;
+
+function getCookie(name) {
+  const match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
+  return match ? decodeURIComponent(match[2]) : "";
+}
+
+function setCookie(name, val) {
+  document.cookie = `${name}=${encodeURIComponent(val)}; Path=/; SameSite=Lax`;
+}
+
+function parseMajorToMinor(valStr) {
+  if (!valStr || typeof valStr !== "string") return null;
+  valStr = valStr.trim();
+  if (currentMinorUnits === 0) {
+    if (!/^\\d+$/.test(valStr)) return null;
+    return parseInt(valStr, 10);
+  }
+  const regex = new RegExp(`^\\\\d+(\\\\.\\\\d{1,${currentMinorUnits}})?$`);
+  if (!regex.test(valStr)) return null;
+  const parts = valStr.split(".");
+  const intPart = parts[0];
+  const decPart = (parts[1] || "").padEnd(currentMinorUnits, "0");
+  return parseInt(intPart + decPart, 10);
+}
+
+function formatMinor(minor) {
+  if (minor === undefined || minor === null) return "0";
+  if (currentMinorUnits === 0) return `${minor} ${currentCurrency}`;
+  const s = String(minor).padStart(currentMinorUnits + 1, "0");
+  const whole = s.slice(0, -currentMinorUnits);
+  const frac = s.slice(-currentMinorUnits);
+  return `${whole}.${frac} ${currentCurrency}`;
+}
+
+async function apiCall(method, path, body, extraHeaders = {}) {
+  const headers = { "Accept": "application/json", ...extraHeaders };
+  if (currentToken) {
+    headers["Authorization"] = `Bearer ${currentToken}`;
+  }
+  let payload = undefined;
+  if (body !== undefined && body !== null) {
+    headers["Content-Type"] = "application/json";
+    payload = JSON.stringify(body);
+  }
+  try {
+    const res = await fetch(path, { method, headers, body: payload });
+    let data = null;
+    try { data = await res.json(); } catch(e) {}
+    return { ok: res.ok, status: res.status, data };
+  } catch (err) {
+    return { ok: false, status: 0, error: err.message };
+  }
+}
+
+async function init() {
+  window.addEventListener("popstate", handleRoute);
+  document.addEventListener("click", e => {
+    const anchor = e.target.closest("a");
+    if (anchor && anchor.origin === window.location.origin && !anchor.hasAttribute("download") && anchor.target !== "_blank") {
+      e.preventDefault();
+      navigateTo(anchor.pathname);
+    }
+  });
+
+  if (currentToken) {
+    const res = await apiCall("GET", "/me");
+    if (res.ok && res.data) {
+      currentUser = res.data;
+      currentCurrency = currentUser.currency;
+      currentMinorUnits = currentUser.minor_units;
+    } else {
+      currentToken = "";
+      localStorage.removeItem("pocketful_token");
+      setCookie("token", "");
+    }
+  }
+  renderHeader();
+  handleRoute();
+}
+
+function navigateTo(path) {
+  window.history.pushState({}, "", path);
+  handleRoute();
+}
+
+function renderHeader() {
+  const headerContainer = document.getElementById("auth-header");
+  if (!headerContainer) return;
+  if (currentUser) {
+    headerContainer.innerHTML = `
+      <div class="user-badge">
+        <span data-testid="current-user">@${currentUser.handle}</span>
+        <button class="btn-sm btn-secondary" id="logout-btn">Log out</button>
+      </div>
+    `;
+    document.getElementById("logout-btn").onclick = () => {
+      currentUser = null;
+      currentToken = "";
+      localStorage.removeItem("pocketful_token");
+      setCookie("token", "");
+      renderHeader();
+      navigateTo("/login");
+    };
+  } else {
+    headerContainer.innerHTML = `
+      <div style="display:flex;gap:0.75rem;">
+        <a href="/login" class="btn-sm btn-secondary" style="text-decoration:none;display:inline-block;">Log in</a>
+        <a href="/signup" class="btn-sm" style="text-decoration:none;display:inline-block;">Sign up</a>
+      </div>
+    `;
+  }
+}
+
+function handleRoute() {
+  const path = window.location.pathname;
+  document.querySelectorAll("#nav-links a").forEach(el => {
+    el.classList.toggle("active", el.getAttribute("href") === path);
+  });
+
+  if (!currentUser && path !== "/login" && path !== "/signup") {
+    navigateTo("/login");
+    return;
+  }
+  if (currentUser && (path === "/login" || path === "/signup")) {
+    navigateTo("/");
+    return;
+  }
+
+  if (path === "/login") renderLogin();
+  else if (path === "/signup") renderSignup();
+  else if (path === "/requests") renderRequests();
+  else if (path === "/split") renderSplit();
+  else if (path === "/authorizations") renderAuthorizations();
+  else if (path === "/statement") renderStatement();
+  else renderWallet();
+}
+
+function renderLogin() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="card" style="max-width:420px;margin:2rem auto;">
+      <h2>Log in to Pocketful</h2>
+      <div id="login-error" class="error-box" style="display:none;"></div>
+      <form id="login-form">
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="login-email" required autocomplete="email">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="login-password" required autocomplete="current-password">
+        </div>
+        <button type="submit" style="width:100%;">Log in</button>
+      </form>
+    </div>
+  `;
+  document.getElementById("login-form").onsubmit = async e => {
+    e.preventDefault();
+    const email = document.getElementById("login-email").value.trim();
+    const password = document.getElementById("login-password").value;
+    const errBox = document.getElementById("login-error");
+    errBox.style.display = "none";
+    const res = await apiCall("POST", "/auth/login", { email, password });
+    if (res.ok && res.data) {
+      currentToken = res.data.token;
+      localStorage.setItem("pocketful_token", currentToken);
+      setCookie("token", currentToken);
+      const meRes = await apiCall("GET", "/me");
+      if (meRes.ok) {
+        currentUser = meRes.data;
+        currentCurrency = currentUser.currency;
+        currentMinorUnits = currentUser.minor_units;
+      }
+      renderHeader();
+      navigateTo("/");
+    } else {
+      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Login failed";
+      errBox.style.display = "block";
+    }
+  };
+}
+
+function renderSignup() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="card" style="max-width:420px;margin:2rem auto;">
+      <h2>Create an Account</h2>
+      <div id="signup-error" class="error-box" style="display:none;"></div>
+      <form id="signup-form">
+        <div class="form-group">
+          <label>Email</label>
+          <input type="email" id="signup-email" required>
+        </div>
+        <div class="form-group">
+          <label>Handle (optional)</label>
+          <input type="text" id="signup-handle" placeholder="letters, numbers, _">
+        </div>
+        <div class="form-group">
+          <label>Display Name (optional)</label>
+          <input type="text" id="signup-display-name">
+        </div>
+        <div class="form-group">
+          <label>Password</label>
+          <input type="password" id="signup-password" required>
+        </div>
+        <button type="submit" style="width:100%;">Sign up</button>
+      </form>
+    </div>
+  `;
+  document.getElementById("signup-form").onsubmit = async e => {
+    e.preventDefault();
+    const email = document.getElementById("signup-email").value.trim();
+    const handle = document.getElementById("signup-handle").value.trim() || undefined;
+    const display_name = document.getElementById("signup-display-name").value.trim() || undefined;
+    const password = document.getElementById("signup-password").value;
+    const errBox = document.getElementById("signup-error");
+    errBox.style.display = "none";
+    const res = await apiCall("POST", "/auth/signup", { email, handle, display_name, password });
+    if (res.ok && res.data) {
+      currentToken = res.data.token;
+      localStorage.setItem("pocketful_token", currentToken);
+      setCookie("token", currentToken);
+      const meRes = await apiCall("GET", "/me");
+      if (meRes.ok) {
+        currentUser = meRes.data;
+        currentCurrency = currentUser.currency;
+        currentMinorUnits = currentUser.minor_units;
+      }
+      renderHeader();
+      navigateTo("/");
+    } else {
+      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Signup failed";
+      errBox.style.display = "block";
+    }
+  };
+}
+
+async function renderWallet() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="card balance-card">
+      <div class="balance-label">Total Balance</div>
+      <div class="balance-headline" data-testid="balance-headline">${formatMinor(currentUser.balance)}</div>
+      <div class="balance-secondary">
+        <div>Available: <strong data-testid="balance-available">${formatMinor(currentUser.available)}</strong></div>
+        <div>Held: <strong data-testid="balance-held">${formatMinor(currentUser.held)}</strong></div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <h3>Send a Payment</h3>
+        <div id="pay-error" class="error-box" style="display:none;"></div>
+        <div id="pay-uncertain" class="uncertain-box" style="display:none;">Network failure. Payment may be pending. Check activity before retrying.</div>
+        <form id="pay-form">
+          <div class="form-group">
+            <label>Recipient Handle</label>
+            <input type="text" id="pay-to-handle" data-testid="pay-recipient" required placeholder="handle">
+          </div>
+          <div class="form-group">
+            <label>Amount (${currentCurrency})</label>
+            <input type="text" id="pay-amount-input" data-testid="pay-amount" required placeholder="0.00">
+          </div>
+          <div class="form-group">
+            <label>Note (optional)</label>
+            <input type="text" id="pay-note-input" data-testid="pay-note" placeholder="What's this for?">
+          </div>
+          <button type="submit" id="pay-submit-btn" data-testid="pay-submit" style="width:100%;">Pay</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+          <h3 style="margin-bottom:0;">Recent Activity</h3>
+          <button class="btn-sm btn-secondary" id="refresh-activity-btn" data-testid="refresh-feed">Refresh</button>
+        </div>
+        <div id="activity-list" data-testid="activity-feed">Loading...</div>
+      </div>
+    </div>
+  `;
+
+  payFormKey = crypto.randomUUID();
+  payFormSnapshot = null;
+
+  const toInput = document.getElementById("pay-to-handle");
+  const amtInput = document.getElementById("pay-amount-input");
+  const noteInput = document.getElementById("pay-note-input");
+
+  function onFormChange() {
+    const currentSnap = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
+    if (payFormSnapshot !== null && currentSnap !== payFormSnapshot) {
+      payFormKey = crypto.randomUUID();
+      payFormSnapshot = null;
+    }
+  }
+  toInput.oninput = onFormChange;
+  amtInput.oninput = onFormChange;
+  noteInput.oninput = onFormChange;
+
+  document.getElementById("pay-form").onsubmit = async e => {
+    e.preventDefault();
+    const to_handle = toInput.value.trim().replace(/^@/, "");
+    const minorAmt = parseMajorToMinor(amtInput.value);
+    const note = noteInput.value.trim();
+    const errBox = document.getElementById("pay-error");
+    const uncBox = document.getElementById("pay-uncertain");
+    errBox.style.display = "none";
+    uncBox.style.display = "none";
+
+    if (minorAmt === null || minorAmt <= 0) {
+      errBox.textContent = "Please enter a valid amount.";
+      errBox.style.display = "block";
+      return;
+    }
+
+    payFormSnapshot = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
+    const submitBtn = document.getElementById("pay-submit-btn");
+    submitBtn.disabled = true;
+
+    const res = await apiCall("POST", "/payments", {
+      to_handle,
+      amount: minorAmt,
+      note: note || undefined
+    }, { "Idempotency-Key": payFormKey });
+
+    submitBtn.disabled = false;
+
+    if (res.ok) {
+      payFormKey = crypto.randomUUID();
+      payFormSnapshot = null;
+      toInput.value = "";
+      amtInput.value = "";
+      noteInput.value = "";
+      await refreshWalletData();
+    } else if (res.status === 0) {
+      uncBox.style.display = "block";
+    } else {
+      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Payment failed";
+      errBox.style.display = "block";
+    }
+  };
+
+  document.getElementById("refresh-activity-btn").onclick = refreshWalletData;
+  await loadActivity();
+}
+
+async function refreshWalletData() {
+  const seq = ++latestRefreshSeq;
+  const meRes = await apiCall("GET", "/me");
+  if (seq === latestRefreshSeq && meRes.ok) {
+    currentUser = meRes.data;
+    const headline = document.querySelector('[data-testid="balance-headline"]');
+    const avail = document.querySelector('[data-testid="balance-available"]');
+    const held = document.querySelector('[data-testid="balance-held"]');
+    if (headline) headline.textContent = formatMinor(currentUser.balance);
+    if (avail) avail.textContent = formatMinor(currentUser.available);
+    if (held) held.textContent = formatMinor(currentUser.held);
+  }
+  await loadActivity(seq);
+}
+
+async function loadActivity(seq = 0) {
+  const container = document.getElementById("activity-list");
+  if (!container) return;
+  const res = await apiCall("GET", "/activity?limit=20");
+  if (seq !== 0 && seq !== latestRefreshSeq) return;
+  if (!res.ok || !res.data || !res.data.payments) {
+    container.innerHTML = `<div class="empty-state">Unable to load activity.</div>`;
+    return;
+  }
+  const payments = res.data.payments;
+  if (payments.length === 0) {
+    container.innerHTML = `<div class="empty-state">No payments yet.</div>`;
+    return;
+  }
+  container.innerHTML = payments.map(p => {
+    const isSender = (p.from_user_id === currentUser.user_id);
+    const sign = isSender ? "-" : "+";
+    const color = isSender ? "var(--text)" : "var(--success)";
+    const counterparty = isSender ? `@${p.to_handle}` : `@${p.from_handle}`;
+    const desc = isSender ? `Paid ${counterparty}` : `Received from ${counterparty}`;
+    return `
+      <div class="list-item" data-testid="activity-item">
+        <div>
+          <div style="font-weight:600;">${desc}</div>
+          <div style="font-size:0.8rem;color:var(--text-muted);">${p.note || "No memo"}</div>
+        </div>
+        <div style="font-weight:700;color:${color};">
+          ${sign}${formatMinor(p.amount)}
+        </div>
+      </div>
+    `;
+  }).join("");
+}
+
+async function renderRequests() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="grid-2">
+      <div class="card">
+        <h3>Incoming Requests</h3>
+        <div id="incoming-requests-list">Loading...</div>
+      </div>
+      <div class="card">
+        <h3>Outgoing Requests</h3>
+        <div id="outgoing-requests-list">Loading...</div>
+      </div>
+    </div>
+  `;
+  await Promise.all([loadRequests("incoming"), loadRequests("outgoing")]);
+}
+
+async function loadRequests(direction) {
+  const container = document.getElementById(`${direction}-requests-list`);
+  if (!container) return;
+  const res = await apiCall("GET", `/requests?direction=${direction}`);
+  if (!res.ok || !res.data || !res.data.requests) {
+    container.innerHTML = `<div class="empty-state">Unable to load requests.</div>`;
+    return;
+  }
+  const requests = res.data.requests;
+  if (requests.length === 0) {
+    container.innerHTML = `<div class="empty-state">No ${direction} requests.</div>`;
+    return;
+  }
+  container.innerHTML = requests.map(r => {
+    const other = direction === "incoming" ? `@${r.requester_handle}` : `@${r.payer_handle}`;
+    let actions = "";
+    if (r.status === "pending") {
+      if (direction === "incoming") {
+        actions = `
+          <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
+            <button class="btn-sm" onclick="payRequest('${r.request_id}')">Pay</button>
+            <button class="btn-sm btn-secondary" onclick="declineRequest('${r.request_id}')">Decline</button>
+          </div>
+        `;
+      } else {
+        actions = `
+          <div style="margin-top:0.5rem;">
+            <button class="btn-sm btn-danger" onclick="cancelRequest('${r.request_id}')">Cancel</button>
+          </div>
+        `;
+      }
+    }
+    return `
+      <div class="list-item" style="flex-direction:column;align-items:stretch;gap:0.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <strong>${other}</strong> requested <strong>${formatMinor(r.amount)}</strong>
+            <div style="font-size:0.8rem;color:var(--text-muted);">${r.note || "No memo"}</div>
+          </div>
+          <span class="badge badge-${r.status}">${r.status}</span>
+        </div>
+        ${actions}
+      </div>
+    `;
+  }).join("");
+}
+
+window.payRequest = async function(reqId) {
+  const key = crypto.randomUUID();
+  const res = await apiCall("POST", `/requests/${reqId}/pay`, {}, { "Idempotency-Key": key });
+  if (res.ok) {
+    renderRequests();
+  } else {
+    alert((res.data && res.data.error && res.data.error.code) || "Failed to pay request");
+  }
+};
+
+window.declineRequest = async function(reqId) {
+  const res = await apiCall("POST", `/requests/${reqId}/decline`);
+  if (res.ok) renderRequests();
+  else alert((res.data && res.data.error && res.data.error.code) || "Failed to decline");
+};
+
+window.cancelRequest = async function(reqId) {
+  const res = await apiCall("POST", `/requests/${reqId}/cancel`);
+  if (res.ok) renderRequests();
+  else alert((res.data && res.data.error && res.data.error.code) || "Failed to cancel");
+};
+
+function renderSplit() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="card" style="max-width:550px;margin:1rem auto;">
+      <h2>Split an Expense</h2>
+      <div id="split-error" class="error-box" style="display:none;"></div>
+      <form id="split-form">
+        <div class="form-group">
+          <label>Total Amount (${currentCurrency})</label>
+          <input type="text" id="split-amount" required placeholder="0.00">
+        </div>
+        <div class="form-group">
+          <label>Participant Handles (comma-separated, including yourself)</label>
+          <input type="text" id="split-handles" required placeholder="ada, bob, cy" value="${currentUser ? currentUser.handle : ''}">
+        </div>
+        <div class="form-group">
+          <label>Note (optional)</label>
+          <input type="text" id="split-note" placeholder="Dinner, cab fare, etc.">
+        </div>
+        <div class="split-preview-box" id="split-preview">
+          <div style="font-weight:600;margin-bottom:0.5rem;">Live Split Preview</div>
+          <div id="split-shares-preview" style="color:var(--text-muted);font-size:0.9rem;">Enter amount and participants to see preview.</div>
+        </div>
+        <button type="submit" style="width:100%;margin-top:1.5rem;">Create Split Requests</button>
+      </form>
+    </div>
+  `;
+
+  const amtInput = document.getElementById("split-amount");
+  const handlesInput = document.getElementById("split-handles");
+
+  function updatePreview() {
+    const minor = parseMajorToMinor(amtInput.value);
+    const rawHandles = handlesInput.value.split(",").map(h => h.trim().replace(/^@/, "")).filter(Boolean);
+    const previewDiv = document.getElementById("split-shares-preview");
+    if (!minor || minor <= 0 || rawHandles.length === 0) {
+      previewDiv.textContent = "Enter amount and participants to see preview.";
+      return;
+    }
+    const n = rawHandles.length;
+    const base = Math.floor(minor / n);
+    const remainder = minor - (base * n);
+    previewDiv.innerHTML = rawHandles.map((h, i) => {
+      const share = base + (i < remainder ? 1 : 0);
+      return `<div style="display:flex;justify-content:space-between;padding:0.25rem 0;"><span>@${h}</span><strong>${formatMinor(share)}</strong></div>`;
+    }).join("");
+  }
+
+  amtInput.oninput = updatePreview;
+  handlesInput.oninput = updatePreview;
+
+  document.getElementById("split-form").onsubmit = async e => {
+    e.preventDefault();
+    const minor = parseMajorToMinor(amtInput.value);
+    const handles = handlesInput.value.split(",").map(h => h.trim().replace(/^@/, "")).filter(Boolean);
+    const note = document.getElementById("split-note").value.trim();
+    const errBox = document.getElementById("split-error");
+    errBox.style.display = "none";
+
+    if (!minor || minor <= 0) {
+      errBox.textContent = "Please enter a valid amount.";
+      errBox.style.display = "block";
+      return;
+    }
+
+    const key = crypto.randomUUID();
+    const res = await apiCall("POST", "/splits", {
+      amount: minor,
+      participant_handles: handles,
+      note: note || undefined
+    }, { "Idempotency-Key": key });
+
+    if (res.ok) {
+      navigateTo("/requests");
+    } else {
+      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Split creation failed";
+      errBox.style.display = "block";
+    }
+  };
+}
+
+async function renderAuthorizations() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="grid-2">
+      <div class="card">
+        <h3>Authorize a Hold</h3>
+        <div id="auth-error" class="error-box" style="display:none;"></div>
+        <div id="auth-uncertain" class="uncertain-box" style="display:none;">Network failure. Authorization may be pending.</div>
+        <form id="auth-form">
+          <div class="form-group">
+            <label>Recipient Handle</label>
+            <input type="text" id="auth-to-handle" data-testid="authorize-recipient" required placeholder="merchant handle">
+          </div>
+          <div class="form-group">
+            <label>Hold Amount (${currentCurrency})</label>
+            <input type="text" id="auth-amount-input" data-testid="authorize-amount" required placeholder="0.00">
+          </div>
+          <div class="form-group">
+            <label>Note (optional)</label>
+            <input type="text" id="auth-note-input" data-testid="authorize-note" placeholder="Hotel deposit, etc.">
+          </div>
+          <button type="submit" id="auth-submit-btn" data-testid="authorize-submit" style="width:100%;">Authorize</button>
+        </form>
+      </div>
+
+      <div class="card">
+        <h3>Active Authorizations</h3>
+        <div id="auth-list">Loading...</div>
+      </div>
+    </div>
+  `;
+
+  authorizeFormKey = crypto.randomUUID();
+  authorizeFormSnapshot = null;
+
+  const toInput = document.getElementById("auth-to-handle");
+  const amtInput = document.getElementById("auth-amount-input");
+  const noteInput = document.getElementById("auth-note-input");
+
+  function onAuthChange() {
+    const cur = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
+    if (authorizeFormSnapshot !== null && cur !== authorizeFormSnapshot) {
+      authorizeFormKey = crypto.randomUUID();
+      authorizeFormSnapshot = null;
+    }
+  }
+  toInput.oninput = onAuthChange;
+  amtInput.oninput = onAuthChange;
+  noteInput.oninput = onAuthChange;
+
+  document.getElementById("auth-form").onsubmit = async e => {
+    e.preventDefault();
+    const to_handle = toInput.value.trim().replace(/^@/, "");
+    const minor = parseMajorToMinor(amtInput.value);
+    const note = noteInput.value.trim();
+    const errBox = document.getElementById("auth-error");
+    const uncBox = document.getElementById("auth-uncertain");
+    errBox.style.display = "none";
+    uncBox.style.display = "none";
+
+    if (!minor || minor <= 0) {
+      errBox.textContent = "Please enter a valid amount.";
+      errBox.style.display = "block";
+      return;
+    }
+
+    authorizeFormSnapshot = `${toInput.value}|${amtInput.value}|${noteInput.value}`;
+    const submitBtn = document.getElementById("auth-submit-btn");
+    submitBtn.disabled = true;
+
+    const res = await apiCall("POST", "/authorizations", {
+      to_handle,
+      amount: minor,
+      note: note || undefined
+    }, { "Idempotency-Key": authorizeFormKey });
+
+    submitBtn.disabled = false;
+
+    if (res.ok) {
+      authorizeFormKey = crypto.randomUUID();
+      authorizeFormSnapshot = null;
+      toInput.value = "";
+      amtInput.value = "";
+      noteInput.value = "";
+      renderAuthorizations();
+    } else if (res.status === 0) {
+      uncBox.style.display = "block";
+    } else {
+      errBox.textContent = (res.data && res.data.error && res.data.error.code) || "Authorization failed";
+      errBox.style.display = "block";
+    }
+  };
+
+  await loadAuthorizations();
+}
+
+async function loadAuthorizations() {
+  const container = document.getElementById("auth-list");
+  if (!container) return;
+  const res = await apiCall("GET", "/authorizations");
+  if (!res.ok || !res.data || !res.data.authorizations) {
+    container.innerHTML = `<div class="empty-state">Unable to load authorizations.</div>`;
+    return;
+  }
+  const auths = res.data.authorizations;
+  if (auths.length === 0) {
+    container.innerHTML = `<div class="empty-state">No authorizations yet.</div>`;
+    return;
+  }
+  container.innerHTML = auths.map(a => {
+    const isPayer = (a.from_user_id === currentUser.user_id);
+    const counterparty = isPayer ? `@${a.to_handle}` : `@${a.from_handle}`;
+    let actionButtons = "";
+    if (a.status === "open") {
+      if (isPayer) {
+        actionButtons = `<button class="btn-sm btn-danger" onclick="voidAuth('${a.authorization_id}')">Void</button>`;
+      } else {
+        actionButtons = `<button class="btn-sm" onclick="captureAuth('${a.authorization_id}', ${a.remaining_amount})">Capture Full</button>`;
+      }
+    }
+    return `
+      <div class="list-item" style="flex-direction:column;align-items:stretch;gap:0.5rem;">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <strong>${counterparty}</strong> — ${formatMinor(a.amount)}
+            <div style="font-size:0.8rem;color:var(--text-muted);">Remaining: ${formatMinor(a.remaining_amount)}</div>
+          </div>
+          <span class="badge badge-${a.status}">${a.status}</span>
+        </div>
+        ${actionButtons ? `<div style="margin-top:0.25rem;">${actionButtons}</div>` : ""}
+      </div>
+    `;
+  }).join("");
+}
+
+window.voidAuth = async function(authId) {
+  const res = await apiCall("POST", `/authorizations/${authId}/void`);
+  if (res.ok) renderAuthorizations();
+  else alert((res.data && res.data.error && res.data.error.code) || "Failed to void authorization");
+};
+
+window.captureAuth = async function(authId, remaining) {
+  const key = crypto.randomUUID();
+  const res = await apiCall("POST", `/authorizations/${authId}/capture`, {
+    amount: remaining,
+    final: true
+  }, { "Idempotency-Key": key });
+  if (res.ok) renderAuthorizations();
+  else alert((res.data && res.data.error && res.data.error.code) || "Failed to capture authorization");
+};
+
+async function renderStatement() {
+  const root = document.getElementById("app-root");
+  root.innerHTML = `
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:1rem;">
+        <h2>Account Statement</h2>
+        <button class="btn-sm btn-secondary" onclick="renderStatement()">Refresh</button>
+      </div>
+      <div id="statement-content">Loading statement...</div>
+    </div>
+  `;
+
+  const container = document.getElementById("statement-content");
+  const res = await apiCall("GET", "/statement");
+  if (!res.ok || !res.data) {
+    container.innerHTML = `<div class="empty-state">Unable to load statement.</div>`;
+    return;
+  }
+
+  const s = res.data;
+  let rows = s.entries.map(e => {
+    const isPositive = e.delta >= 0;
+    const deltaColor = isPositive ? "var(--success)" : "var(--text)";
+    const sign = isPositive ? "+" : "";
+    return `
+      <tr>
+        <td>${e.effective_at.slice(0, 19).replace("T", " ")}</td>
+        <td>${e.payment.from_handle === currentUser.handle ? '@' + e.payment.to_handle : '@' + e.payment.from_handle}</td>
+        <td>${e.payment.note || "-"}</td>
+        <td>rev ${e.revision}</td>
+        <td style="color:${deltaColor};font-weight:600;">${sign}${formatMinor(e.delta)}</td>
+        <td style="font-weight:700;">${formatMinor(e.balance_after)}</td>
+      </tr>
+    `;
+  }).join("");
+
+  if (s.entries.length === 0) {
+    rows = `<tr><td colspan="6" style="text-align:center;color:var(--text-muted);padding:2rem;">No entries in statement window.</td></tr>`;
+  }
+
+  container.innerHTML = `
+    <div style="display:flex;gap:2rem;margin-bottom:1.5rem;background:#0b1120;padding:1rem;border-radius:8px;">
+      <div>Opening Balance: <strong>${formatMinor(s.opening_balance)}</strong></div>
+      <div>Closing Balance: <strong>${formatMinor(s.closing_balance)}</strong></div>
+    </div>
+    <table class="statement-table">
+      <thead>
+        <tr>
+          <th>Effective Date</th>
+          <th>Counterparty</th>
+          <th>Memo</th>
+          <th>Revision</th>
+          <th>Delta</th>
+          <th>Balance After</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${rows}
+      </tbody>
+    </table>
+  `;
+}
+
+window.onload = init;
+</script>
+</body>
+</html>
+"""
+
+
+# =============================================================================
+# Request Handler
+# =============================================================================
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        # Silence default stderr logging
+        pass
+
+    def send_json(self, status: int, data: any):
+        resp_bytes = b"" if data is None else json.dumps(data).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp_bytes)))
+        self.end_headers()
+        if resp_bytes:
+            self.wfile.write(resp_bytes)
+
+    def send_html(self, status: int, html_str: str):
+        resp_bytes = html_str.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(resp_bytes)))
+        self.end_headers()
+        self.wfile.write(resp_bytes)
+
+    def fail(self, status: int, code: str):
+        self.send_json(status, {"error": {"code": code}})
+
+    def read_body(self) -> any:
+        content_length = self.headers.get("Content-Length")
+        if not content_length:
+            return None
+        try:
+            length = int(content_length)
+            raw = self.rfile.read(length).decode("utf-8")
+            if not raw:
+                return None
+            return json.loads(raw)
+        except Exception:
+            return None
+
+    def get_auth_user(self) -> dict | None:
+        token = None
+        auth_header = self.headers.get("Authorization")
+        if auth_header and auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+
+        if not token:
+            cookie_header = self.headers.get("Cookie")
+            if cookie_header:
+                cookies = http.cookies.SimpleCookie(cookie_header)
+                if "token" in cookies:
+                    token = cookies["token"].value
+
+        if not token:
+            return None
+
+        with STATE_LOCK:
+            user_id = STATE["tokens"].get(token)
+            if not user_id:
+                return None
+            return STATE["users"].get(user_id)
+
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def route(self, method: str):
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path.rstrip("/") or "/"
+        accept = self.headers.get("Accept", "")
+
+        # Unauthenticated endpoints
+        if method == "GET" and path == "/health":
+            return self.send_json(200, {"status": "ok"})
+
+        if method == "POST" and path == "/_test/reset":
+            return self.handle_reset()
+
+        if method == "GET" and path == "/_test/export":
+            return self.handle_export()
+
+        if method == "POST" and path == "/_test/import":
+            return self.handle_import()
+
+        if method == "POST" and path == "/auth/signup":
+            return self.handle_signup()
+
+        if method == "POST" and path == "/auth/login":
+            return self.handle_login()
+
+        # HTML UI Routes
+        if method == "GET":
+            if path in ("/", "/login", "/signup", "/split"):
+                return self.send_html(200, INDEX_HTML)
+
+            if path in ("/requests", "/authorizations", "/statement") and "text/html" in accept:
+                return self.send_html(200, INDEX_HTML)
+
+        # All other endpoints require authentication
+        user = self.get_auth_user()
+        if not user:
+            return self.fail(401, "unauthenticated")
+
+        # GET API endpoints
+        if method == "GET":
+            if path == "/me":
+                return self.handle_me(user, parsed_url.query)
+            if path == "/activity":
+                return self.handle_activity(user, parsed_url.query)
+            if path == "/requests":
+                return self.handle_requests_list(user, parsed_url.query)
+            if path == "/authorizations":
+                return self.handle_authorizations_list(user, parsed_url.query)
+            if path == "/statement":
+                return self.handle_statement(user, parsed_url.query)
+            if path.startswith("/payments/") and path.endswith("/revisions"):
+                payment_id = path.split("/")[2]
+                return self.handle_payment_revisions(payment_id, user)
+            return self.fail(404, "not_found")
+
+        # POST endpoints
+        if method == "POST":
+            # Idempotent write paths
+            idempotent_paths = (
+                "/payments",
+                "/requests",
+                "/splits",
+                "/settlements",
+                "/authorizations"
+            )
+            is_idem = (
+                path in idempotent_paths
+                or (path.startswith("/requests/") and path.endswith("/pay"))
+                or (path.startswith("/authorizations/") and path.endswith("/capture"))
+                or (path.startswith("/payments/") and path.endswith("/corrections"))
+            )
+            if is_idem:
+                return self.handle_idempotent_post(method, path, user)
+
+            # Non-idempotent write paths
+            if path.startswith("/requests/") and path.endswith("/decline"):
+                request_id = path.split("/")[2]
+                return self.handle_request_decline(request_id, user)
+
+            if path.startswith("/requests/") and path.endswith("/cancel"):
+                request_id = path.split("/")[2]
+                return self.handle_request_cancel(request_id, user)
+
+            if path.startswith("/authorizations/") and path.endswith("/void"):
+                auth_id = path.split("/")[2]
+                return self.handle_authorization_void(auth_id, user)
+
+            return self.fail(404, "not_found")
+
+    # =========================================================================
+    # Test Fixtures & Harness
+    # =========================================================================
+
+    def handle_reset(self):
+        fixture = self.read_body()
+        if fixture is None or not isinstance(fixture, dict):
+            return self.fail(400, "malformed_request")
+
+        # Validate users & balances
+        for u in fixture.get("users", []):
+            if not isinstance(u.get("handle"), str) or not re.fullmatch(r"^[a-z0-9_]{1,20}$", u["handle"]):
+                return self.fail(422, "validation_failed")
+            if u.get("balance", 0) < 0:
+                return self.fail(422, "validation_failed")
+
+        now_dt = datetime.now(timezone.utc)
+        now_str = now_dt.isoformat()
+
+        # Seeded payments validation: created_at in the future -> 422 validation_failed (no state change)
+        for p in fixture.get("payments", []):
+            if "created_at" in p and p["created_at"]:
+                p_dt = parse_rfc3339(p["created_at"])
+                if p_dt is None or p_dt > now_dt:
+                    return self.fail(422, "validation_failed")
+
+        # Validate authorizations & sum of unexpired open holds <= balance
+        auths_fixture = fixture.get("authorizations", [])
+        user_balances_map = {u["id"]: int(u.get("balance", 0)) for u in fixture.get("users", [])}
+        user_holds_map = {u["id"]: 0 for u in fixture.get("users", [])}
+
+        for a in auths_fixture:
+            amt = int(a.get("amount", 0))
+            if amt < 1 or amt > 1_000_000_000:
+                return self.fail(422, "validation_failed")
+            fid = a.get("from_user_id") or a.get("from_id")
+            status = a.get("status", "open")
+            expires_at = a.get("expires_at", "")
+            if status == "open" and expires_at > now_str:
+                if fid in user_holds_map:
+                    user_holds_map[fid] += amt
+
+        for uid, total_bal in user_balances_map.items():
+            if user_holds_map[uid] > total_bal:
+                return self.fail(422, "validation_failed")
+
+        ttl = fixture.get("authorization_ttl_seconds", 600)
+        if not isinstance(ttl, int) or ttl <= 0:
+            return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            global LAST_TIMESTAMP, PAYMENT_SEQ, REQUEST_SEQ, AUTH_SEQ, SETTLEMENT_SEQ
+            LAST_TIMESTAMP = None
+            PAYMENT_SEQ = 0
+            REQUEST_SEQ = 0
+            AUTH_SEQ = 0
+            SETTLEMENT_SEQ = 0
+
+            reset_time_str = now_str
+            STATE["currency"] = fixture.get("currency", "EUR")
+            STATE["minor_units"] = fixture.get("minor_units", 2)
+            STATE["authorization_ttl_seconds"] = ttl
+            STATE["settlement_operator_ids"] = set(fixture.get("settlement_operator_ids", []))
+            STATE["reset_time"] = reset_time_str
+            STATE["users"] = {}
+            STATE["by_handle"] = {}
+            STATE["by_email"] = {}
+            STATE["tokens"] = {}
+            STATE["payments"] = []
+            STATE["requests"] = []
+            STATE["authorizations"] = []
+            STATE["snapshots"] = {}
+            STATE["idempotency"] = {}
+
+            seeded_payments = fixture.get("payments", [])
+            for u in fixture.get("users", []):
+                uid = u["id"]
+                ending_balance = int(u.get("balance", 0))
+                # opening balance = ending balance minus net effect of seeded payments
+                net_effect = sum(int(p["amount"]) for p in seeded_payments if (p.get("to_user_id") or p.get("to_id")) == uid) \
+                           - sum(int(p["amount"]) for p in seeded_payments if (p.get("from_user_id") or p.get("from_id")) == uid)
+                opening_balance = ending_balance - net_effect
+
+                raw_pwd = u.get("password", "")
+                if raw_pwd.startswith("scrypt$"):
+                    hashed_pwd = raw_pwd
+                else:
+                    deterministic_salt = hashlib.md5(f"salt:{uid}:{raw_pwd}".encode()).hexdigest()[:32]
+                    hashed_pwd = hash_password(raw_pwd, salt=deterministic_salt)
+
+                user_obj = {
+                    "id": uid,
+                    "email": u["email"],
+                    "password": hashed_pwd,
+                    "display_name": u.get("display_name", u.get("handle", "")),
+                    "handle": u["handle"],
+                    "balance": ending_balance,
+                    "opening_balance": opening_balance
+                }
+                STATE["users"][uid] = user_obj
+                STATE["by_handle"][user_obj["handle"]] = uid
+                STATE["by_email"][user_obj["email"].lower()] = uid
+
+            for p in seeded_payments:
+                from_id = p.get("from_user_id") or p.get("from_id")
+                to_id = p.get("to_user_id") or p.get("to_id")
+                from_u = STATE["users"].get(from_id)
+                to_u = STATE["users"].get(to_id)
+                pid = p.get("id") or p.get("payment_id") or f"p_{uuid.uuid4().hex[:8]}"
+                created_at = p.get("created_at") or reset_time_str
+                amt = int(p["amount"])
+                pm = {
+                    "payment_id": pid,
+                    "from_user_id": from_id,
+                    "from_handle": from_u["handle"] if from_u else "",
+                    "to_user_id": to_id,
+                    "to_handle": to_u["handle"] if to_u else "",
+                    "amount": amt,
+                    "currency": STATE["currency"],
+                    "note": p.get("note", ""),
+                    "visibility": p.get("visibility", "public"),
+                    "request_id": p.get("request_id"),
+                    "authorization_id": p.get("authorization_id"),
+                    "settlement_id": p.get("settlement_id"),
+                    "created_at": created_at,
+                    "revisions": [
+                        {
+                            "payment_id": pid,
+                            "revision": 1,
+                            "amount": amt,
+                            "effective_at": created_at,
+                            "recorded_at": created_at,
+                            "reason": ""
+                        }
+                    ]
+                }
+                STATE["payments"].append(pm)
+
+            for r in fixture.get("requests", []):
+                req_id = r.get("id") or r.get("request_id") or f"rq_{uuid.uuid4().hex[:8]}"
+                requester_id = r.get("requester_user_id") or r.get("requester_id")
+                payer_id = r.get("payer_user_id") or r.get("payer_id")
+                req_u = STATE["users"].get(requester_id)
+                pay_u = STATE["users"].get(payer_id)
+                rq = {
+                    "request_id": req_id,
+                    "requester_id": requester_id,
+                    "requester_handle": req_u["handle"] if req_u else "",
+                    "payer_id": payer_id,
+                    "payer_handle": pay_u["handle"] if pay_u else "",
+                    "amount": int(r["amount"]),
+                    "currency": STATE["currency"],
+                    "note": r.get("note", ""),
+                    "status": r.get("status", "pending"),
+                    "created_at": r.get("created_at") or reset_time_str,
+                    "payment_id": r.get("payment_id")
+                }
+                STATE["requests"].append(rq)
+
+            for a in auths_fixture:
+                auth_id = a.get("id") or a.get("authorization_id") or f"a_{uuid.uuid4().hex[:8]}"
+                from_id = a.get("from_user_id") or a.get("from_id")
+                to_id = a.get("to_user_id") or a.get("to_id")
+                from_u = STATE["users"].get(from_id)
+                to_u = STATE["users"].get(to_id)
+                created_at = a.get("created_at") or reset_time_str
+                expires_at = a.get("expires_at") or (now_dt + timedelta(seconds=ttl)).isoformat()
+                status = a.get("status", "open")
+                amt = int(a["amount"])
+                cap_amt = int(a.get("captured_amount", 0))
+                p_id = a.get("payment_id")
+                p_ids = a.get("payment_ids", ([p_id] if p_id else []))
+
+                rem = (amt - cap_amt) if status == "open" else 0
+                if status == "open" and expires_at <= now_str:
+                    status = "expired"
+                    rem = 0
+
+                closed_at = None if status == "open" else a.get("closed_at", expires_at)
+
+                au = {
+                    "authorization_id": auth_id,
+                    "from_user_id": from_id,
+                    "from_handle": from_u["handle"] if from_u else "",
+                    "to_user_id": to_id,
+                    "to_handle": to_u["handle"] if to_u else "",
+                    "amount": amt,
+                    "captured_amount": cap_amt,
+                    "remaining_amount": rem,
+                    "currency": STATE["currency"],
+                    "note": a.get("note", ""),
+                    "visibility": a.get("visibility", "public"),
+                    "status": status,
+                    "expires_at": expires_at,
+                    "closed_at": closed_at,
+                    "payment_id": p_id,
+                    "payment_ids": p_ids,
+                    "created_at": created_at,
+                    "events": []
+                }
+                STATE["authorizations"].append(au)
+
+            check_and_update_authorizations_expiry(reset_time_str)
+
+        return self.send_json(204, None)
+
+    def handle_export(self):
+        with STATE_LOCK:
+            export_data = {
+                "track": "pocketful",
+                "format_version": 3,
+                "state": {
+                    "currency": STATE["currency"],
+                    "minor_units": STATE["minor_units"],
+                    "authorization_ttl_seconds": STATE["authorization_ttl_seconds"],
+                    "settlement_operator_ids": list(STATE["settlement_operator_ids"]),
+                    "reset_time": STATE["reset_time"],
+                    "users": list(STATE["users"].values()),
+                    "by_handle": STATE["by_handle"],
+                    "by_email": STATE["by_email"],
+                    "tokens": STATE["tokens"],
+                    "payments": STATE["payments"],
+                    "requests": STATE["requests"],
+                    "authorizations": STATE["authorizations"],
+                    "snapshots": STATE["snapshots"],
+                    "idempotency": [
+                        {
+                            "token": list(k),
+                            "canonical_body": v["canonical_body"],
+                            "response": v["response"],
+                            "status": v["status"]
+                        }
+                        for k, v in STATE["idempotency"].items()
+                    ]
+                }
+            }
+        return self.send_json(200, export_data)
+
+    def handle_import(self):
+        data = self.read_body()
+        if data is None or not isinstance(data, dict):
+            return self.fail(400, "malformed_request")
+
+        s = data.get("state", data)
+        with STATE_LOCK:
+            STATE["currency"] = s.get("currency", "EUR")
+            STATE["minor_units"] = s.get("minor_units", 2)
+            STATE["authorization_ttl_seconds"] = s.get("authorization_ttl_seconds", 600)
+            STATE["settlement_operator_ids"] = set(s.get("settlement_operator_ids", []))
+            STATE["reset_time"] = s.get("reset_time")
+
+            imported_payments = [dict(p) for p in s.get("payments", [])]
+            for p in imported_payments:
+                if "revisions" not in p or not p["revisions"]:
+                    p["revisions"] = [{
+                        "payment_id": p["payment_id"],
+                        "revision": 1,
+                        "amount": p["amount"],
+                        "effective_at": p["created_at"],
+                        "recorded_at": p["created_at"],
+                        "reason": ""
+                    }]
+            STATE["payments"] = imported_payments
+
+            raw_users = s.get("users", [])
+            user_list = list(raw_users.values()) if isinstance(raw_users, dict) else raw_users
+
+            STATE["users"] = {}
+            for u in user_list:
+                u_dict = dict(u)
+                if "opening_balance" not in u_dict:
+                    net_effect = sum(p["amount"] for p in imported_payments if p["to_user_id"] == u_dict["id"]) \
+                               - sum(p["amount"] for p in imported_payments if p["from_user_id"] == u_dict["id"])
+                    u_dict["opening_balance"] = u_dict["balance"] - net_effect
+                STATE["users"][u_dict["id"]] = u_dict
+
+            if "by_handle" in s and isinstance(s["by_handle"], dict):
+                STATE["by_handle"].update(s["by_handle"])
+            if "by_email" in s and isinstance(s["by_email"], dict):
+                STATE["by_email"].update(s["by_email"])
+
+            STATE["tokens"] = dict(s.get("tokens", {}))
+            STATE["requests"] = [dict(r) for r in s.get("requests", [])]
+
+            imported_auths = [dict(a) for a in s.get("authorizations", [])]
+            for a in imported_auths:
+                if "events" not in a:
+                    a["events"] = []
+                if "closed_at" not in a:
+                    a["closed_at"] = None if a["status"] == "open" else a.get("expires_at")
+            STATE["authorizations"] = imported_auths
+
+            STATE["snapshots"] = dict(s.get("snapshots", {}))
+
+            STATE["idempotency"] = {}
+            raw_idem = s.get("idempotency", {})
+            if isinstance(raw_idem, dict):
+                for k_str, v in raw_idem.items():
+                    try:
+                        k_tuple = tuple(json.loads(k_str))
+                        STATE["idempotency"][k_tuple] = v
+                    except Exception:
+                        pass
+            elif isinstance(raw_idem, list):
+                for item in raw_idem:
+                    try:
+                        k_tuple = tuple(item["token"])
+                        STATE["idempotency"][k_tuple] = {
+                            "canonical_body": item["canonical_body"],
+                            "response": item["response"],
+                            "status": item["status"]
+                        }
+                    except Exception:
+                        pass
+
+            check_and_update_authorizations_expiry()
+
+        return self.send_json(204, None)
+
+    # =========================================================================
+    # Authentication
+    # =========================================================================
+
+    def handle_signup(self):
+        data = self.read_body()
+        if data is None or not isinstance(data, dict):
+            return self.fail(400, "malformed_request")
+
+        email = data.get("email")
+        password = data.get("password")
+        display_name = data.get("display_name")
+        handle = data.get("handle")
+
+        if not isinstance(email, str) or not isinstance(password, str):
+            return self.fail(400, "malformed_request")
+
+        if "@" not in email:
+            return self.fail(422, "validation_failed")
+
+        if handle is None:
+            local_part = email.split("@")[0].lower()
+            derived_handle = re.sub(r"[^a-z0-9_]", "_", local_part)[:20]
+        else:
+            if not isinstance(handle, str) or not re.fullmatch(r"^[a-z0-9_]{1,20}$", handle):
+                return self.fail(422, "validation_failed")
+            derived_handle = handle
+
+        if not derived_handle:
+            return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            if email.lower() in STATE["by_email"] or derived_handle in STATE["by_handle"]:
+                return self.fail(409, "user_already_exists")
+
+            user_id = f"u_{derived_handle}_{uuid.uuid4().hex[:4]}"
+            user = {
+                "id": user_id,
+                "email": email,
+                "password": hash_password(password),
+                "display_name": display_name if isinstance(display_name, str) else derived_handle,
+                "handle": derived_handle,
+                "balance": 0,
+                "opening_balance": 0  # New accounts open at zero
+            }
+            STATE["users"][user_id] = user
+            STATE["by_email"][email.lower()] = user_id
+            STATE["by_handle"][derived_handle] = user_id
+
+            token = uuid.uuid4().hex
+            STATE["tokens"][token] = user_id
+
+        return self.send_json(201, {
+            "user_id": user_id,
+            "display_name": user["display_name"],
+            "token": token
+        })
+
+    def handle_login(self):
+        data = self.read_body()
+        if data is None or not isinstance(data, dict):
+            return self.fail(400, "malformed_request")
+
+        email = data.get("email")
+        password = data.get("password")
+        if not isinstance(email, str) or not isinstance(password, str):
+            return self.fail(400, "malformed_request")
+
+        with STATE_LOCK:
+            user_id = STATE["by_email"].get(email.lower())
+            if not user_id:
+                return self.fail(401, "unauthenticated")
+            user = STATE["users"].get(user_id)
+            if not user or not verify_password(password, user["password"]):
+                return self.fail(401, "unauthenticated")
+
+            token = uuid.uuid4().hex
+            STATE["tokens"][token] = user_id
+
+        return self.send_json(200, {
+            "user_id": user["id"],
+            "display_name": user["display_name"],
+            "token": token
+        })
+
+    # =========================================================================
+    # Account & Activity
+    # =========================================================================
+
+    def handle_me(self, user, query_str: str):
+        query = parse_qs(query_str, keep_blank_values=True)
+        as_of_str = None
+        known_at_str = None
+        as_of_dt = None
+        known_at_dt = None
+
+        if "as_of" in query:
+            as_of_str = query["as_of"][-1]
+            as_of_dt = parse_rfc3339(as_of_str)
+            if as_of_dt is None:
+                return self.fail(422, "validation_failed")
+
+        if "known_at" in query:
+            known_at_str = query["known_at"][-1]
+            known_at_dt = parse_rfc3339(known_at_str)
+            if known_at_dt is None:
+                return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            if as_of_str is None and known_at_str is None:
+                total, available, held = get_user_balances(user["id"])
+                current_user = STATE["users"].get(user["id"])
+                return self.send_json(200, {
+                    "user_id": current_user["id"],
+                    "display_name": current_user["display_name"],
+                    "handle": current_user["handle"],
+                    "balance": total,
+                    "total": total,
+                    "available": available,
+                    "held": held,
+                    "currency": STATE["currency"],
+                    "minor_units": STATE["minor_units"]
+                })
+
+            read_instant = monotonic_now_dt()
+            effective_T = as_of_dt if as_of_dt is not None else read_instant
+            effective_K = known_at_dt if known_at_dt is not None else read_instant
+
+            total, available, held = compute_historical_balances(user["id"], effective_T, effective_K)
+            current_user = STATE["users"].get(user["id"])
+            resp = {
+                "user_id": current_user["id"],
+                "display_name": current_user["display_name"],
+                "handle": current_user["handle"],
+                "balance": total,
+                "total": total,
+                "available": max(0, available),
+                "held": held,
+                "currency": STATE["currency"],
+                "minor_units": STATE["minor_units"]
+            }
+            if as_of_str is not None:
+                resp["as_of"] = as_of_str
+            if known_at_str is not None:
+                resp["known_at"] = known_at_str
+            return self.send_json(200, resp)
+
+    def handle_activity(self, user, query_str: str):
+        query = parse_qs(query_str, keep_blank_values=True)
+        limit = 50
+        offset = 0
+
+        if "limit" in query:
+            raw_limit = query["limit"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_limit):
+                return self.fail(422, "validation_failed")
+            limit = int(raw_limit)
+            if not 1 <= limit <= 200:
+                return self.fail(422, "validation_failed")
+
+        if "offset" in query:
+            raw_offset = query["offset"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_offset):
+                return self.fail(422, "validation_failed")
+            offset = int(raw_offset)
+            if offset < 0:
+                return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            caller_id = user["id"]
+            visible = []
+            for p in reversed(STATE["payments"]):
+                is_party = (p["from_user_id"] == caller_id or p["to_user_id"] == caller_id)
+                if p["visibility"] == "public" or is_party:
+                    visible.append(payment_to_dict(p))
+
+            page = visible[offset: offset + limit]
+            has_more = (offset + limit) < len(visible)
+
+        return self.send_json(200, {
+            "payments": page,
+            "has_more": has_more
+        })
+
+    def handle_requests_list(self, user, query_str: str):
+        query = parse_qs(query_str, keep_blank_values=True)
+        direction = None
+        status = None
+        limit = 50
+        offset = 0
+
+        if "direction" in query:
+            direction = query["direction"][-1]
+            if direction not in ("incoming", "outgoing"):
+                return self.fail(422, "validation_failed")
+
+        if "status" in query:
+            status = query["status"][-1]
+            if status not in ("pending", "paid", "declined", "cancelled"):
+                return self.fail(422, "validation_failed")
+
+        if "limit" in query:
+            raw_limit = query["limit"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_limit):
+                return self.fail(422, "validation_failed")
+            limit = int(raw_limit)
+            if not 1 <= limit <= 200:
+                return self.fail(422, "validation_failed")
+
+        if "offset" in query:
+            raw_offset = query["offset"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_offset):
+                return self.fail(422, "validation_failed")
+            offset = int(raw_offset)
+            if offset < 0:
+                return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            caller_id = user["id"]
+            filtered = []
+            for r in reversed(STATE["requests"]):
+                is_requester = (r["requester_id"] == caller_id)
+                is_payer = (r["payer_id"] == caller_id)
+
+                if not (is_requester or is_payer):
+                    continue
+
+                if direction == "incoming" and not is_payer:
+                    continue
+                if direction == "outgoing" and not is_requester:
+                    continue
+
+                if status and r["status"] != status:
+                    continue
+
+                filtered.append(r)
+
+            page = filtered[offset: offset + limit]
+            has_more = (offset + limit) < len(filtered)
+
+        return self.send_json(200, {
+            "requests": page,
+            "has_more": has_more
+        })
+
+    def handle_authorizations_list(self, user, query_str: str):
+        query = parse_qs(query_str, keep_blank_values=True)
+        direction = None
+        status = None
+        limit = 50
+        offset = 0
+
+        if "direction" in query:
+            direction = query["direction"][-1]
+            if direction not in ("incoming", "outgoing"):
+                return self.fail(422, "validation_failed")
+
+        if "status" in query:
+            status = query["status"][-1]
+            if status not in ("open", "captured", "voided", "expired"):
+                return self.fail(422, "validation_failed")
+
+        if "limit" in query:
+            raw_limit = query["limit"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_limit):
+                return self.fail(422, "validation_failed")
+            limit = int(raw_limit)
+            if not 1 <= limit <= 200:
+                return self.fail(422, "validation_failed")
+
+        if "offset" in query:
+            raw_offset = query["offset"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_offset):
+                return self.fail(422, "validation_failed")
+            offset = int(raw_offset)
+            if offset < 0:
+                return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            check_and_update_authorizations_expiry()
+            caller_id = user["id"]
+            filtered = []
+            for a in reversed(STATE["authorizations"]):
+                is_payer = (a["from_user_id"] == caller_id)
+                is_receiver = (a["to_user_id"] == caller_id)
+
+                if not (is_payer or is_receiver):
+                    continue
+
+                if direction == "incoming" and not is_receiver:
+                    continue
+                if direction == "outgoing" and not is_payer:
+                    continue
+
+                if status and a["status"] != status:
+                    continue
+
+                filtered.append(auth_to_dict(a))
+
+            page = filtered[offset: offset + limit]
+            has_more = (offset + limit) < len(filtered)
+
+        return self.send_json(200, {
+            "authorizations": page,
+            "has_more": has_more
+        })
+
+    # =========================================================================
+    # Statement (Stage 3)
+    # =========================================================================
+
+    def handle_statement(self, user, query_str: str):
+        query = parse_qs(query_str, keep_blank_values=True)
+        limit = 50
+        offset = 0
+
+        if "limit" in query:
+            raw_limit = query["limit"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_limit):
+                return self.fail(422, "validation_failed")
+            limit = int(raw_limit)
+            if not 1 <= limit <= 200:
+                return self.fail(422, "validation_failed")
+
+        if "offset" in query:
+            raw_offset = query["offset"][-1]
+            if not re.fullmatch(r"^[0-9]+$", raw_offset):
+                return self.fail(422, "validation_failed")
+            offset = int(raw_offset)
+            if offset < 0:
+                return self.fail(422, "validation_failed")
+
+        with STATE_LOCK:
+            # Check snapshot parameter
+            if "snapshot" in query:
+                if "from" in query or "to" in query or "known_at" in query:
+                    return self.fail(422, "validation_failed")
+
+                snap_token = query["snapshot"][-1]
+                snap = STATE["snapshots"].get(snap_token)
+                if not snap or snap["user_id"] != user["id"]:
+                    return self.fail(404, "not_found")
+
+                entries = snap["entries"]
+                page = entries[offset: offset + limit]
+                has_more = (offset + limit) < len(entries)
+                return self.send_json(200, {
+                    "opening_balance": snap["opening_balance"],
+                    "entries": page,
+                    "closing_balance": snap["closing_balance"],
+                    "has_more": has_more,
+                    "snapshot": snap_token
+                })
+
+            # New statement request
+            from_dt = None
+            to_dt = None
+            known_at_dt = None
+            now_dt = monotonic_now_dt()
+
+            if "from" in query:
+                from_dt = parse_rfc3339(query["from"][-1])
+                if from_dt is None:
+                    return self.fail(422, "validation_failed")
+
+            if "to" in query:
+                to_dt = parse_rfc3339(query["to"][-1])
+                if to_dt is None:
+                    return self.fail(422, "validation_failed")
+            else:
+                to_dt = now_dt
+
+            if "known_at" in query:
+                known_at_dt = parse_rfc3339(query["known_at"][-1])
+                if known_at_dt is None:
+                    return self.fail(422, "validation_failed")
+            else:
+                known_at_dt = now_dt
+
+            if from_dt is not None and to_dt < from_dt:
+                return self.fail(422, "validation_failed")
+
+            caller_id = user["id"]
+            current_user = STATE["users"].get(caller_id)
+            opening_balance = current_user.get("opening_balance", 0)
+
+            window_candidates = []
+
+            for p in STATE["payments"]:
+                if p["from_user_id"] != caller_id and p["to_user_id"] != caller_id:
+                    continue
+
+                revs = [
+                    r for r in p.get("revisions", [])
+                    if parse_rfc3339(r["recorded_at"]) is not None and parse_rfc3339(r["recorded_at"]) <= known_at_dt
+                ]
+                if not revs:
+                    continue
+                sel_rev = max(revs, key=lambda r: r["revision"])
+                eff_dt = parse_rfc3339(sel_rev["effective_at"])
+                if eff_dt is None:
+                    continue
+
+                amt = sel_rev["amount"]
+                is_receiver = (p["to_user_id"] == caller_id)
+
+                if from_dt is not None and eff_dt < from_dt:
+                    if is_receiver:
+                        opening_balance += amt
+                    else:
+                        opening_balance -= amt
+                elif (from_dt is None or eff_dt >= from_dt) and eff_dt < to_dt:
+                    delta = amt if is_receiver else -amt
+                    if amt == 0:
+                        delta = 0
+                    window_candidates.append({
+                        "eff_dt": eff_dt,
+                        "payment_id": p["payment_id"],
+                        "payment": p,
+                        "rev": sel_rev,
+                        "delta": delta
+                    })
+
+            # Sort entries by effective_at ascending, then payment_id ascending
+            window_candidates.sort(key=lambda item: (item["eff_dt"], item["payment_id"]))
+
+            running = opening_balance
+            entries = []
+            for item in window_candidates:
+                running += item["delta"]
+                entry_payment = payment_to_dict(item["payment"])
+                entry_payment["amount"] = item["rev"]["amount"]
+
+                entries.append({
+                    "payment": entry_payment,
+                    "delta": item["delta"],
+                    "balance_after": running,
+                    "revision": item["rev"]["revision"],
+                    "effective_at": item["rev"]["effective_at"],
+                    "recorded_at": item["rev"]["recorded_at"]
+                })
+
+            closing_balance = running
+            snap_token = f"snap_{uuid.uuid4().hex}"
+            STATE["snapshots"][snap_token] = {
+                "user_id": caller_id,
+                "opening_balance": opening_balance,
+                "closing_balance": closing_balance,
+                "entries": entries
+            }
+
+            page = entries[offset: offset + limit]
+            has_more = (offset + limit) < len(entries)
+
+            return self.send_json(200, {
+                "opening_balance": opening_balance,
+                "entries": page,
+                "closing_balance": closing_balance,
+                "has_more": has_more,
+                "snapshot": snap_token
+            })
+
+    # =========================================================================
+    # Payment Revisions (Stage 3)
+    # =========================================================================
+
+    def handle_payment_revisions(self, payment_id: str, user):
+        with STATE_LOCK:
+            payment = next((p for p in STATE["payments"] if p["payment_id"] == payment_id), None)
+            if not payment:
+                return self.fail(404, "not_found")
+
+            caller_id = user["id"]
+            if caller_id != payment["from_user_id"] and caller_id != payment["to_user_id"]:
+                return self.fail(404, "not_found")
+
+            return self.send_json(200, {
+                "revisions": payment.get("revisions", [])
+            })
+
+    # =========================================================================
+    # Idempotent Write Handler
+    # =========================================================================
+
+    def handle_idempotent_post(self, method: str, path: str, user):
+        body = self.read_body()
+        if body is None or not isinstance(body, dict):
+            return self.fail(400, "malformed_request")
+
+        # Check Idempotency-Key
+        idem_key = self.headers.get("Idempotency-Key")
+        if idem_key is None or len(idem_key) == 0:
+            return self.fail(400, "missing_idempotency_key")
+        if len(idem_key) > 255:
+            return self.fail(422, "validation_failed")
+
+        canon_body = canonical_json(body)
+        idem_token = (user["id"], method, path, idem_key)
+
+        with STATE_LOCK:
+            # Check previously completed idempotent request
+            if idem_token in STATE["idempotency"]:
+                record = STATE["idempotency"][idem_token]
+                if record["canonical_body"] == canon_body:
+                    return self.send_json(200, record["response"])
+                else:
+                    return self.fail(409, "idempotency_key_reuse")
+
+            # Route to respective handler
+            if path == "/payments":
+                status, resp = self.exec_payment(user, body)
+            elif path == "/requests":
+                status, resp = self.exec_request(user, body)
+            elif path == "/splits":
+                status, resp = self.exec_split(user, body)
+            elif path == "/settlements":
+                status, resp = self.exec_settlement(user, body)
+            elif path == "/authorizations":
+                status, resp = self.exec_authorization(user, body)
+            elif path.startswith("/requests/") and path.endswith("/pay"):
+                request_id = path.split("/")[2]
+                status, resp = self.exec_request_pay(request_id, user, body)
+            elif path.startswith("/authorizations/") and path.endswith("/capture"):
+                auth_id = path.split("/")[2]
+                status, resp = self.exec_authorization_capture(auth_id, user, body)
+            elif path.startswith("/payments/") and path.endswith("/corrections"):
+                payment_id = path.split("/")[2]
+                status, resp = self.exec_payment_correction(payment_id, user, body)
+            else:
+                return self.fail(404, "not_found")
+
+            # If successful (201), register idempotency key
+            if status == 201:
+                STATE["idempotency"][idem_token] = {
+                    "canonical_body": canon_body,
+                    "response": resp,
+                    "status": 201
+                }
+                return self.send_json(201, resp)
+            else:
+                return self.fail(status, resp)
+
+    # =========================================================================
+    # Business Logic Execution (Under STATE_LOCK)
+    # =========================================================================
+
+    def exec_payment(self, user, body) -> tuple[int, any]:
+        if "to_handle" not in body or "amount" not in body:
+            return 422, "validation_failed"
+
+        to_handle = body.get("to_handle")
+        amount = body.get("amount")
+        note = body.get("note", "")
+        visibility = body.get("visibility", "public")
+
+        if not isinstance(to_handle, str):
+            return 422, "validation_failed"
+        if not re.fullmatch(r"^[a-z0-9_]{1,20}$", to_handle):
+            return 404, "not_found"
+
+        if to_handle == user["handle"]:
+            return 422, "self_payment"
+
+        if not is_valid_amount(amount):
+            return 422, "validation_failed"
+        amount = int(amount)
+
+        if not isinstance(note, str) or len(note) > 200:
+            return 422, "validation_failed"
+
+        if visibility not in ("public", "private"):
+            return 422, "validation_failed"
+
+        to_uid = STATE["by_handle"].get(to_handle)
+        if not to_uid:
+            return 404, "not_found"
+        recipient = STATE["users"][to_uid]
+
+        sender = STATE["users"][user["id"]]
+        _, available, _ = get_user_balances(sender["id"])
+        if available < amount:
+            return 409, "insufficient_funds"
+
+        # Transfer funds
+        sender["balance"] -= amount
+        recipient["balance"] += amount
+
+        payment_id = new_payment_id()
+        created_at = monotonic_now_iso()
+        payment_obj = {
+            "payment_id": payment_id,
+            "from_user_id": sender["id"],
+            "from_handle": sender["handle"],
+            "to_user_id": recipient["id"],
+            "to_handle": recipient["handle"],
+            "amount": amount,
+            "currency": STATE["currency"],
+            "note": note,
+            "visibility": visibility,
+            "request_id": None,
+            "authorization_id": None,
+            "settlement_id": None,
+            "created_at": created_at,
+            "revisions": [
+                {
+                    "payment_id": payment_id,
+                    "revision": 1,
+                    "amount": amount,
+                    "effective_at": created_at,
+                    "recorded_at": created_at,
+                    "reason": ""
+                }
+            ]
+        }
+        STATE["payments"].append(payment_obj)
+        return 201, payment_to_dict(payment_obj)
+
+    def exec_payment_correction(self, payment_id: str, user, body) -> tuple[int, any]:
+        payment = next((p for p in STATE["payments"] if p["payment_id"] == payment_id), None)
+        if not payment:
+            return 404, "not_found"
+
+        if payment["from_user_id"] != user["id"]:
+            return 403, "forbidden"
+
+        # Linked payments are immutable
+        if payment.get("authorization_id") or payment.get("settlement_id"):
+            return 422, "linked_payment_immutable"
+
+        # Required fields validation
+        req_fields = ("expected_revision", "amount", "effective_at", "reason")
+        if any(f not in body for f in req_fields):
+            return 422, "validation_failed"
+
+        expected_rev = body.get("expected_revision")
+        amount = body.get("amount")
+        effective_at = body.get("effective_at")
+        reason = body.get("reason")
+
+        if isinstance(expected_rev, bool) or not isinstance(expected_rev, int) or expected_rev < 1:
+            return 422, "validation_failed"
+
+        if isinstance(amount, bool) or not isinstance(amount, int) or not (0 <= amount <= 1_000_000_000):
+            return 422, "validation_failed"
+
+        if not isinstance(reason, str) or not (1 <= len(reason) <= 200):
+            return 422, "validation_failed"
+
+        eff_dt = parse_rfc3339(effective_at)
+        if eff_dt is None:
+            return 422, "validation_failed"
+
+        now_dt = monotonic_now_dt()
+        if eff_dt > now_dt:
+            return 422, "validation_failed"
+
+        latest_rev = payment["revisions"][-1]
+        if expected_rev != latest_rev["revision"]:
+            return 409, "stale_revision"
+
+        prev_amount = latest_rev["amount"]
+        new_amount = amount
+        delta = new_amount - prev_amount
+
+        sender = STATE["users"][payment["from_user_id"]]
+        receiver = STATE["users"][payment["to_user_id"]]
+
+        _, sender_avail, _ = get_user_balances(sender["id"])
+        _, receiver_avail, _ = get_user_balances(receiver["id"])
+
+        if delta > 0 and sender_avail < delta:
+            return 409, "insufficient_funds"
+        if delta < 0 and receiver_avail < abs(delta):
+            return 409, "insufficient_funds"
+
+        # Determine strictly increasing recorded_at
+        last_rec_dt = parse_rfc3339(latest_rev["recorded_at"])
+        rec_dt = monotonic_now_dt()
+        if last_rec_dt is not None and rec_dt <= last_rec_dt:
+            rec_dt = last_rec_dt + timedelta(microseconds=10)
+            global LAST_TIMESTAMP
+            LAST_TIMESTAMP = rec_dt
+        rec_iso = rec_dt.isoformat()
+
+        candidate_rev = {
+            "payment_id": payment_id,
+            "revision": expected_rev + 1,
+            "amount": new_amount,
+            "effective_at": effective_at,
+            "recorded_at": rec_iso,
+            "reason": reason
+        }
+
+        # Check Historical Overdraft at all boundaries <= now
+        boundaries = set()
+        if STATE.get("reset_time"):
+            r_dt = parse_rfc3339(STATE["reset_time"])
+            if r_dt and r_dt <= now_dt:
+                boundaries.add(r_dt)
+
+        for p in STATE["payments"]:
+            for r in p.get("revisions", []):
+                dt_item = parse_rfc3339(r["effective_at"])
+                if dt_item and dt_item <= now_dt:
+                    boundaries.add(dt_item)
+
+        boundaries.add(eff_dt)
+
+        for a in STATE["authorizations"]:
+            dt_item = parse_rfc3339(a["created_at"])
+            if dt_item and dt_item <= now_dt:
+                boundaries.add(dt_item)
+            exp_item = parse_rfc3339(a["expires_at"])
+            if exp_item and exp_item <= now_dt:
+                boundaries.add(exp_item)
+            for ev in a.get("events", []):
+                ev_item = parse_rfc3339(ev["time"])
+                if ev_item and ev_item <= now_dt:
+                    boundaries.add(ev_item)
+
+        # Evaluate overdraft under proposed revision for all users
+        for b_dt in sorted(boundaries):
+            for u_id in STATE["users"]:
+                tot, avail, _ = compute_historical_balances(u_id, b_dt, rec_dt,
+                                                           candidate_payment_id=payment_id,
+                                                           candidate_rev=candidate_rev)
+                if tot < 0 or avail < 0:
+                    return 409, "historical_overdraft"
+
+        # Apply current balance changes
+        if delta > 0:
+            sender["balance"] -= delta
+            receiver["balance"] += delta
+        elif delta < 0:
+            sender["balance"] += abs(delta)
+            receiver["balance"] -= abs(delta)
+
+        payment["revisions"].append(candidate_rev)
+        return 201, candidate_rev
+
+    def exec_request(self, user, body) -> tuple[int, any]:
+        if "payer_handle" not in body or "amount" not in body:
+            return 422, "validation_failed"
+
+        payer_handle = body.get("payer_handle")
+        amount = body.get("amount")
+        note = body.get("note", "")
+
+        if not isinstance(payer_handle, str):
+            return 422, "validation_failed"
+        if not re.fullmatch(r"^[a-z0-9_]{1,20}$", payer_handle):
+            return 404, "not_found"
+
+        if payer_handle == user["handle"]:
+            return 422, "self_request"
+
+        if not is_valid_amount(amount):
+            return 422, "validation_failed"
+        amount = int(amount)
+
+        if not isinstance(note, str) or len(note) > 200:
+            return 422, "validation_failed"
+
+        payer_uid = STATE["by_handle"].get(payer_handle)
+        if not payer_uid:
+            return 404, "not_found"
+        payer = STATE["users"][payer_uid]
+
+        request_id = new_request_id()
+        created_at = monotonic_now_iso()
+        request_obj = {
+            "request_id": request_id,
+            "requester_id": user["id"],
+            "requester_handle": user["handle"],
+            "payer_id": payer["id"],
+            "payer_handle": payer["handle"],
+            "amount": amount,
+            "currency": STATE["currency"],
+            "note": note,
+            "status": "pending",
+            "created_at": created_at,
+            "payment_id": None
+        }
+        STATE["requests"].append(request_obj)
+        return 201, request_obj
+
+    def exec_request_pay(self, request_id: str, user, body) -> tuple[int, any]:
+        visibility = body.get("visibility", "public")
+        if visibility not in ("public", "private"):
+            return 422, "validation_failed"
+
+        req = next((r for r in STATE["requests"] if r["request_id"] == request_id), None)
+        if not req:
+            return 404, "not_found"
+
+        if user["id"] != req["payer_id"]:
+            return 403, "forbidden"
+
+        if req["status"] != "pending":
+            return 409, "request_not_pending"
+
+        payer = STATE["users"][req["payer_id"]]
+        requester = STATE["users"][req["requester_id"]]
+        amount = req["amount"]
+
+        _, available, _ = get_user_balances(payer["id"])
+        if available < amount:
+            return 409, "insufficient_funds"
+
+        # Transfer funds
+        payer["balance"] -= amount
+        requester["balance"] += amount
+
+        payment_id = new_payment_id()
+        created_at = monotonic_now_iso()
+        payment_obj = {
+            "payment_id": payment_id,
+            "from_user_id": payer["id"],
+            "from_handle": payer["handle"],
+            "to_user_id": requester["id"],
+            "to_handle": requester["handle"],
+            "amount": amount,
+            "currency": STATE["currency"],
+            "note": req["note"],
+            "visibility": visibility,
+            "request_id": req["request_id"],
+            "authorization_id": None,
+            "settlement_id": None,
+            "created_at": created_at,
+            "revisions": [
+                {
+                    "payment_id": payment_id,
+                    "revision": 1,
+                    "amount": amount,
+                    "effective_at": created_at,
+                    "recorded_at": created_at,
+                    "reason": ""
+                }
+            ]
+        }
+        STATE["payments"].append(payment_obj)
+
+        req["status"] = "paid"
+        req["payment_id"] = payment_id
+
+        return 201, payment_to_dict(payment_obj)
+
+    def handle_request_decline(self, request_id: str, user):
+        with STATE_LOCK:
+            req = next((r for r in STATE["requests"] if r["request_id"] == request_id), None)
+            if not req:
+                return self.fail(404, "not_found")
+
+            if user["id"] != req["payer_id"]:
+                return self.fail(403, "forbidden")
+
+            if req["status"] != "pending":
+                return self.fail(409, "request_not_pending")
+
+            req["status"] = "declined"
+            return self.send_json(200, req)
+
+    def handle_request_cancel(self, request_id: str, user):
+        with STATE_LOCK:
+            req = next((r for r in STATE["requests"] if r["request_id"] == request_id), None)
+            if not req:
+                return self.fail(404, "not_found")
+
+            if user["id"] != req["requester_id"]:
+                return self.fail(403, "forbidden")
+
+            if req["status"] != "pending":
+                return self.fail(409, "request_not_pending")
+
+            req["status"] = "cancelled"
+            return self.send_json(200, req)
+
+    def exec_split(self, user, body) -> tuple[int, any]:
+        amount = body.get("amount")
+        handles = body.get("participant_handles")
+        note = body.get("note", "")
+
+        if not is_valid_amount(amount):
+            return 422, "validation_failed"
+        amount = int(amount)
+
+        if not isinstance(handles, list) or len(handles) == 0:
+            return 422, "validation_failed"
+
+        if len(set(handles)) != len(handles):
+            return 422, "validation_failed"
+
+        for h in handles:
+            if not isinstance(h, str) or not re.fullmatch(r"^[a-z0-9_]{1,20}$", h):
+                return 404, "not_found"
+            if h not in STATE["by_handle"]:
+                return 404, "not_found"
+
+        if not isinstance(note, str) or len(note) > 200:
+            return 422, "validation_failed"
+
+        n = len(handles)
+        base = amount // n
+        remainder = amount - (base * n)
+
+        shares = []
+        for i, h in enumerate(handles):
+            share_amt = base + (1 if i < remainder else 0)
+            shares.append({"handle": h, "amount": share_amt})
+
+        created_requests = []
+        created_at = monotonic_now_iso()
+        for s in shares:
+            target_handle = s["handle"]
+            if target_handle == user["handle"]:
+                continue
+            payer_uid = STATE["by_handle"][target_handle]
+            payer = STATE["users"][payer_uid]
+
+            rq_id = new_request_id()
+            rq_obj = {
+                "request_id": rq_id,
+                "requester_id": user["id"],
+                "requester_handle": user["handle"],
+                "payer_id": payer["id"],
+                "payer_handle": payer["handle"],
+                "amount": s["amount"],
+                "currency": STATE["currency"],
+                "note": note,
+                "status": "pending",
+                "created_at": created_at,
+                "payment_id": None
+            }
+            STATE["requests"].append(rq_obj)
+            created_requests.append(rq_obj)
+
+        return 201, {
+            "shares": shares,
+            "requests": created_requests
+        }
+
+    def exec_settlement(self, user, body) -> tuple[int, any]:
+        if user["id"] not in STATE["settlement_operator_ids"]:
+            return 403, "forbidden"
+
+        transfers = body.get("transfers")
+        note = body.get("note", "")
+
+        if not isinstance(transfers, list) or len(transfers) == 0:
+            return 422, "validation_failed"
+
+        if not isinstance(note, str) or len(note) > 200:
+            return 422, "validation_failed"
+
+        user_net = {}
+        for t in transfers:
+            if not isinstance(t, dict):
+                return 422, "validation_failed"
+            from_h = t.get("from_handle")
+            to_h = t.get("to_handle")
+            amt = t.get("amount")
+
+            if not isinstance(from_h, str) or from_h not in STATE["by_handle"]:
+                return 404, "not_found"
+            if not isinstance(to_h, str) or to_h not in STATE["by_handle"]:
+                return 404, "not_found"
+
+            if from_h == to_h:
+                return 422, "validation_failed"
+
+            if not is_valid_amount(amt):
+                return 422, "validation_failed"
+            amt = int(amt)
+
+            from_uid = STATE["by_handle"][from_h]
+            to_uid = STATE["by_handle"][to_h]
+
+            user_net[from_uid] = user_net.get(from_uid, 0) - amt
+            user_net[to_uid] = user_net.get(to_uid, 0) + amt
+
+        for uid, net in user_net.items():
+            if net < 0:
+                _, available, _ = get_user_balances(uid)
+                if available < (-net):
+                    return 409, "insufficient_funds"
+
+        settlement_id = new_settlement_id()
+        created_at = monotonic_now_iso()
+        payment_ids = []
+
+        for t in transfers:
+            amt = int(t["amount"])
+            from_uid = STATE["by_handle"][t["from_handle"]]
+            to_uid = STATE["by_handle"][t["to_handle"]]
+            sender = STATE["users"][from_uid]
+            recipient = STATE["users"][to_uid]
+
+            sender["balance"] -= amt
+            recipient["balance"] += amt
+
+            pid = new_payment_id()
+            pm = {
+                "payment_id": pid,
+                "from_user_id": sender["id"],
+                "from_handle": sender["handle"],
+                "to_user_id": recipient["id"],
+                "to_handle": recipient["handle"],
+                "amount": amt,
+                "currency": STATE["currency"],
+                "note": note,
+                "visibility": "private",
+                "request_id": None,
+                "authorization_id": None,
+                "settlement_id": settlement_id,
+                "created_at": created_at,
+                "revisions": [
+                    {
+                        "payment_id": pid,
+                        "revision": 1,
+                        "amount": amt,
+                        "effective_at": created_at,
+                        "recorded_at": created_at,
+                        "reason": ""
+                    }
+                ]
+            }
+            STATE["payments"].append(pm)
+            payment_ids.append(pid)
+
+        return 201, {
+            "settlement_id": settlement_id,
+            "transfers_count": len(transfers),
+            "payment_ids": payment_ids,
+            "created_at": created_at
+        }
+
+    # =========================================================================
+    # Authorizations & Holds (Stage 2)
+    # =========================================================================
+
+    def exec_authorization(self, user, body) -> tuple[int, any]:
+        if "to_handle" not in body or "amount" not in body:
+            return 422, "validation_failed"
+
+        to_handle = body.get("to_handle")
+        amount = body.get("amount")
+        note = body.get("note", "")
+        visibility = body.get("visibility", "public")
+
+        if not isinstance(to_handle, str):
+            return 422, "validation_failed"
+        if not re.fullmatch(r"^[a-z0-9_]{1,20}$", to_handle):
+            return 404, "not_found"
+
+        if to_handle == user["handle"]:
+            return 422, "self_payment"
+
+        if not is_valid_amount(amount):
+            return 422, "validation_failed"
+        amount = int(amount)
+
+        if not isinstance(note, str) or len(note) > 200:
+            return 422, "validation_failed"
+
+        if visibility not in ("public", "private"):
+            return 422, "validation_failed"
+
+        to_uid = STATE["by_handle"].get(to_handle)
+        if not to_uid:
+            return 404, "not_found"
+        recipient = STATE["users"][to_uid]
+
+        sender = STATE["users"][user["id"]]
+        _, available, _ = get_user_balances(sender["id"])
+        if available < amount:
+            return 409, "insufficient_funds"
+
+        ttl = STATE.get("authorization_ttl_seconds", 600)
+        created_at = monotonic_now_iso()
+        now_dt = parse_rfc3339(created_at)
+        expires_at = (now_dt + timedelta(seconds=ttl)).isoformat()
+        auth_id = new_auth_id()
+
+        auth_obj = {
+            "authorization_id": auth_id,
+            "from_user_id": sender["id"],
+            "from_handle": sender["handle"],
+            "to_user_id": recipient["id"],
+            "to_handle": recipient["handle"],
+            "amount": amount,
+            "captured_amount": 0,
+            "remaining_amount": amount,
+            "currency": STATE["currency"],
+            "note": note,
+            "visibility": visibility,
+            "status": "open",
+            "expires_at": expires_at,
+            "closed_at": None,
+            "payment_id": None,
+            "payment_ids": [],
+            "created_at": created_at,
+            "events": []
+        }
+        STATE["authorizations"].append(auth_obj)
+        return 201, auth_to_dict(auth_obj)
+
+    def exec_authorization_capture(self, auth_id: str, user, body) -> tuple[int, any]:
+        auth = next((a for a in STATE["authorizations"] if a["authorization_id"] == auth_id), None)
+        if not auth:
+            return 404, "not_found"
+
+        if user["id"] != auth["to_user_id"]:
+            return 403, "forbidden"
+
+        now_str = monotonic_now_iso()
+        if auth["expires_at"] <= now_str:
+            if auth["status"] == "open":
+                auth["status"] = "expired"
+                auth["remaining_amount"] = 0
+                auth["closed_at"] = auth["expires_at"]
+            return 409, "authorization_expired"
+
+        if auth["status"] != "open":
+            return 409, "authorization_not_open"
+
+        remaining = auth["amount"] - auth["captured_amount"]
+        amount = body.get("amount", remaining)
+        final = body.get("final", True)
+
+        if amount is None:
+            amount = remaining
+
+        if not is_valid_amount(amount):
+            return 422, "validation_failed"
+        amount = int(amount)
+
+        if not isinstance(final, bool):
+            return 422, "validation_failed"
+
+        if amount > remaining:
+            return 422, "capture_exceeds_authorization"
+
+        payer = STATE["users"][auth["from_user_id"]]
+        receiver = STATE["users"][auth["to_user_id"]]
+
+        # Transfer funds
+        payer["balance"] -= amount
+        receiver["balance"] += amount
+
+        payment_id = new_payment_id()
+        payment_obj = {
+            "payment_id": payment_id,
+            "from_user_id": payer["id"],
+            "from_handle": payer["handle"],
+            "to_user_id": receiver["id"],
+            "to_handle": receiver["handle"],
+            "amount": amount,
+            "currency": STATE["currency"],
+            "note": auth["note"],
+            "visibility": auth["visibility"],
+            "request_id": None,
+            "authorization_id": auth["authorization_id"],
+            "settlement_id": None,
+            "created_at": now_str,
+            "revisions": [
+                {
+                    "payment_id": payment_id,
+                    "revision": 1,
+                    "amount": amount,
+                    "effective_at": now_str,
+                    "recorded_at": now_str,
+                    "reason": ""
+                }
+            ]
+        }
+        STATE["payments"].append(payment_obj)
+
+        auth["captured_amount"] += amount
+        auth["payment_id"] = payment_id
+        if "payment_ids" not in auth:
+            auth["payment_ids"] = []
+        auth["payment_ids"].append(payment_id)
+
+        auth["events"].append({
+            "type": "capture",
+            "time": now_str,
+            "amount": amount,
+            "final": final
+        })
+
+        remaining_now = auth["amount"] - auth["captured_amount"]
+        if final or remaining_now == 0:
+            auth["status"] = "captured"
+            auth["remaining_amount"] = 0
+            auth["closed_at"] = now_str
+        else:
+            auth["status"] = "open"
+            auth["remaining_amount"] = remaining_now
+
+        return 201, payment_to_dict(payment_obj)
+
+    def handle_authorization_void(self, auth_id: str, user):
+        with STATE_LOCK:
+            auth = next((a for a in STATE["authorizations"] if a["authorization_id"] == auth_id), None)
+            if not auth:
+                return self.fail(404, "not_found")
+
+            if user["id"] != auth["from_user_id"]:
+                return self.fail(403, "forbidden")
+
+            if auth["status"] == "voided":
+                return self.send_json(200, auth_to_dict(auth))
+
+            now_str = now_iso()
+            if auth["expires_at"] <= now_str:
+                auth["status"] = "expired"
+                auth["remaining_amount"] = 0
+                auth["closed_at"] = auth["expires_at"]
+                return self.fail(409, "authorization_not_open")
+
+            if auth["status"] != "open":
+                return self.fail(409, "authorization_not_open")
+
+            auth["status"] = "voided"
+            auth["remaining_amount"] = 0
+            auth["closed_at"] = now_str
+            auth["events"].append({
+                "type": "void",
+                "time": now_str
+            })
+            return self.send_json(200, auth_to_dict(auth))
+
+
+def run_server():
+    port = int(os.environ.get("PORT", "8080"))
+    server = ThreadingHTTPServer(("0.0.0.0", port), Handler)
+    print(f"Pocketful Stage 3 Server listening on port {port}...")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
+
+if __name__ == "__main__":
+    run_server()
