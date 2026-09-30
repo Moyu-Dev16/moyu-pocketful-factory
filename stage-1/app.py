@@ -320,7 +320,7 @@ def validate_candidate_state(candidate: dict) -> None:
                     expected_credit = payment["to_user_id"] if delta > 0 else payment["from_user_id"]
                     if debit["account_id"] == expected_debit and credit["account_id"] == expected_credit:
                         matches.append(index + 1)
-            if len(matches) != 1 or payment.get("request_id") or payment.get("settlement_id"):
+            if len(matches) != 1:
                 raise ValueError("invalid_correction_entries")
             revision_number = matches[0]
         else:

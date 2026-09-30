@@ -251,6 +251,46 @@ class WalletContractTests(unittest.TestCase):
         self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
         self.assertEqual(before, self.export_document())
 
+    def test_corrected_request_payment_export_import_round_trip(self):
+        _, request = self.request(
+            "POST", "/requests", {"payer_handle": "alice", "amount": 15},
+            self.bob, "linked-request-create"
+        )
+        status, payment = self.request(
+            "POST", f"/requests/{request['request_id']}/pay", {},
+            self.alice, "linked-request-pay"
+        )
+        self.assertEqual(201, status)
+        status, _ = self.request(
+            "POST", f"/payments/{payment['payment_id']}/corrections",
+            {"expected_revision": 1, "amount": 10,
+             "effective_at": payment["effective_at"], "reason": "请求支付金额更正"},
+            self.alice, "linked-request-correction"
+        )
+        self.assertEqual(201, status)
+        before = self.export_document()
+        self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
+        self.assertEqual(before, self.export_document())
+
+    def test_corrected_settlement_payment_export_import_round_trip(self):
+        status, settlement = self.request(
+            "POST", "/settlements", {
+                "transfers": [{"from_handle": "alice", "to_handle": "bob", "amount": 15}]
+            }, self.alice, "linked-settlement-create"
+        )
+        self.assertEqual(201, status)
+        payment = settlement["payments"][0]
+        status, _ = self.request(
+            "POST", f"/payments/{payment['payment_id']}/corrections",
+            {"expected_revision": 1, "amount": 10,
+             "effective_at": payment["effective_at"], "reason": "结算支付金额更正"},
+            self.alice, "linked-settlement-correction"
+        )
+        self.assertEqual(201, status)
+        before = self.export_document()
+        self.assertEqual(204, self.request("POST", "/_test/import", before)[0])
+        self.assertEqual(before, self.export_document())
+
 
 if __name__ == "__main__":
     unittest.main()
