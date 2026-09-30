@@ -1,11 +1,11 @@
-# Pocketful — Stage 3 Run Guide
+# Pocketful — Stage 4 Run Guide
 
 ## Build
 
 Build the isolated container image:
 
 ```bash
-docker build -t pocketful-stage-3 .
+docker build -t pocketful-stage-4 .
 ```
 
 ## Run
@@ -13,7 +13,7 @@ docker build -t pocketful-stage-3 .
 Run the container listening on port 8080 without external network dependencies:
 
 ```bash
-docker run --rm -p 8080:8080 -e PORT=8080 pocketful-stage-3
+docker run --rm -p 8080:8080 -e PORT=8080 pocketful-stage-4
 ```
 
 ## Health Verification
